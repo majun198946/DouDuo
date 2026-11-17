@@ -1651,8 +1651,9 @@ struct DYUpstreamFeedScreen: DYRecommendFeedHost {
         .onReceive(Timer.publish(every: 30, on: .main, in: .common).autoconnect()) { _ in
             DYLiveModel.log(String(format: "DDMEM 常驻=%.0fMB 缓存条数=%d 暖机=%d", DYMemoryProbe.footprintMB, DYVideoCache.limit, DYPreloader.ahead))
         }
-        // 5 秒定时 saveSession 已移除：它会在翻页那一帧额外触发一次写盘，放大掉帧；
-        // 进度防丢改由退后台（willResignActive）和 onSavePosition 回调兜底，语义不变。
+        .onReceive(Timer.publish(every: 5, on: .main, in: .common).autoconnect()) { _ in
+            if DDPlayback.shared.appIsActive { saveSession() }
+        }
         .onChange(of: cacheCount) { _, _ in focusCurrent() }
         .task(id: blockedHashtags) { await applyHashtagFilter() }
         .onChange(of: feed.landscapeWhenWide) { _, _ in remixUpcoming() }
@@ -2877,7 +2878,9 @@ struct DYClassicFeedScreen: DYRecommendFeedHost {
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
             saveSession()
         }
-        // 5 秒定时 saveSession 已移除：翻页时额外写盘会放大掉帧，进度防丢改由退后台 + onSavePosition 兜底
+        .onReceive(Timer.publish(every: 5, on: .main, in: .common).autoconnect()) { _ in
+            if DDPlayback.shared.appIsActive { saveSession() }
+        }
         .onChange(of: cacheCount) { _, _ in focusCurrent() }
         .task(id: blockedHashtags) { await applyHashtagFilter() }
         .onChange(of: feed.landscapeWhenWide) { _, _ in remixUpcoming() }

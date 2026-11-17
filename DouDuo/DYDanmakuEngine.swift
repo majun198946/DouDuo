@@ -67,10 +67,6 @@ final class DYDanmakuEngineView: UIView {
     private var deduplicate = true
     private var maxPerSecond = 4
     private var spawnedAt: [Double] = []      // 最近一秒的出场时刻（限流）
-    // 后台预渲染：文字光栅化是主线程突发热点，弹幕一进队列就提前在后台渲染好，
-    // spawn 时直接命中缓存，主线程不再突发 UIGraphicsImageRenderer 光栅化。
-    private var prerendered = Set<String>()
-    private let renderQueue = DispatchQueue(label: "douduo.danmaku.render", qos: .userInitiated, attributes: .concurrent)
     // 诊断
     private var lastTS: CFTimeInterval = 0
     private var gaps: [Double] = []
@@ -107,30 +103,10 @@ final class DYDanmakuEngineView: UIView {
     private func merge(_ items: [DYDanmaku]) {
         let fresh = items.filter { $0.offset.isFinite && $0.offset >= 0 && !$0.id.isEmpty && !queued.contains($0.id) }
         guard !fresh.isEmpty else { return }
-        for d in fresh {
-            queued.insert(d.id)
-            prerender(d)   // 后台预渲染文字，出场时主线程直接命中缓存
-        }
+        for d in fresh { queued.insert(d.id) }
         let resumeFrom = cursor < queue.count ? queue[cursor].offset : (lastT >= 0 ? lastT : 0)
-        // 增量合并：queue 已按 (offset, id) 有序，逐条二分插入 fresh，避免每次 chunk 到达都全量 O(n log n) 重排。
-        // 长视频弹幕分段到达时，这是主线程的一次性热点（之前整片重排会让开头几秒弹幕一卡一卡）。
-        for d in fresh {
-            let idx = insertionIndex(of: d, in: queue)
-            queue.insert(d, at: idx)
-        }
+        queue = (queue + fresh).sorted { $0.offset == $1.offset ? $0.id < $1.id : $0.offset < $1.offset }
         cursor = queue.firstIndex { $0.offset >= resumeFrom } ?? queue.count
-    }
-
-    /// 二分查找 d 应插入的位置，维持 (offset 升序, 同 offset 按 id 升序) 的有序性。
-    private func insertionIndex(of d: DYDanmaku, in sorted: [DYDanmaku]) -> Int {
-        var lo = 0, hi = sorted.count
-        while lo < hi {
-            let mid = (lo + hi) / 2
-            let m = sorted[mid]
-            let before = m.offset < d.offset || (m.offset == d.offset && m.id < d.id)
-            if before { lo = mid + 1 } else { hi = mid }
-        }
-        return lo
     }
 
     /// 跳转/重新开始：清屏，从 t 往后排
@@ -155,9 +131,7 @@ final class DYDanmakuEngineView: UIView {
     private func start() {
         guard link == nil, window != nil else { return }
         let l = CADisplayLink(target: DYDanmakuEngineTick(self), selector: #selector(DYDanmakuEngineTick.tick(_:)))
-        // 上限 60Hz：120Hz 每帧跑主线程刷新弹幕纯属浪费——弹幕移动是匀速线性，
-        // 60 帧已足够平滑，减半主线程 tick 频率能明显降低播放中的掉帧压力。
-        l.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
+        l.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
         l.add(to: .main, forMode: .common)
         link = l
         lastTS = 0
@@ -270,32 +244,9 @@ final class DYDanmakuEngineView: UIView {
         return sizes[d.id] ?? CGSize(width: 60, height: DYDanmakuStyle.laneHeight)
     }
 
-    /// 后台预渲染：文字光栅化挪到后台队列，渲染结果回主线程写缓存。
-    /// spawn 时若缓存已命中，主线程零光栅化开销；未命中则由 image(for:) 同步兜底，保证正确性。
-    private func prerender(_ d: DYDanmaku) {
-        guard !prerendered.contains(d.id), images[d.id] == nil else { return }
-        prerendered.insert(d.id)
-        renderQueue.async { [weak self] in
-            guard let (img, size) = Self.renderText(d.text) else { return }
-            DispatchQueue.main.async {
-                guard let self else { return }
-                if self.images[d.id] == nil { self.images[d.id] = img }
-                if self.sizes[d.id] == nil { self.sizes[d.id] = size }
-            }
-        }
-    }
-
     private func image(for d: DYDanmaku) -> CGImage? {
         if let i = images[d.id] { return i }
         if images.count > 800 { images.removeAll(); sizes.removeAll() }
-        guard let (img, size) = Self.renderText(d.text) else { return nil }
-        images[d.id] = img
-        sizes[d.id] = size
-        return img
-    }
-
-    /// 纯函数：把弹幕文本光栅化成带阴影的 CGImage + 实际尺寸。线程无关，可在后台队列调用。
-    private static func renderText(_ text: String) -> (CGImage, CGSize)? {
         let font = UIFont.systemFont(ofSize: DYDanmakuStyle.fontSize, weight: .semibold)
         let shadow = NSShadow()
         shadow.shadowColor = UIColor.black.withAlphaComponent(0.7)
@@ -304,17 +255,18 @@ final class DYDanmakuEngineView: UIView {
         let attrs: [NSAttributedString.Key: Any] = [
             .font: font, .foregroundColor: UIColor.white.withAlphaComponent(0.95), .shadow: shadow,
         ]
-        let s = text as NSString
-        let size = s.size(withAttributes: attrs)
+        let text = d.text as NSString
+        let size = text.size(withAttributes: attrs)
         let pad: CGFloat = 3
         let box = CGSize(width: ceil(size.width) + pad * 2, height: ceil(size.height) + pad * 2)
         let fmt = UIGraphicsImageRendererFormat.preferred()
         fmt.opaque = false
         let img = UIGraphicsImageRenderer(size: box, format: fmt).image { _ in
-            s.draw(at: CGPoint(x: pad, y: pad), withAttributes: attrs)
+            text.draw(at: CGPoint(x: pad, y: pad), withAttributes: attrs)
         }
-        guard let cg = img.cgImage else { return nil }
-        return (cg, box)
+        images[d.id] = img.cgImage
+        sizes[d.id] = box
+        return img.cgImage
     }
 }
 

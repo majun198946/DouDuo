@@ -6,7 +6,7 @@ import Foundation
 import UIKit
 
 /// 浏览会话保存在 Application Support，不随视频缓存清理或系统回收而丢失。
-struct DYFeedSession: Codable, Sendable {
+struct DYFeedSession: Codable {
     var items: [DYAweme]
     var currentID: String
     var positions: [String: Double]
@@ -22,29 +22,11 @@ struct DYFeedSession: Codable, Sendable {
               session.items.contains(where: { $0.id == session.currentID }) else { return nil }
         return session
     }
-
-    /// 会话写盘串行队列：异步保存可能并发触发（翻页 + 进度回写 + 退后台），
-    /// 串行化避免两个写盘任务同时 atomic write 到同一路径互相踩踏。
-    private static let saveQueue = DispatchQueue(label: "douduo.session.save", qos: .utility)
-
-    /// 同步写盘（冷启动恢复/调试等低频路径保留原语义）。
     func save() {
         guard items.contains(where: { $0.id == currentID }),
               let data = try? JSONEncoder().encode(self) else { return }
         do { try data.write(to: Self.url, options: .atomic) }
         catch { DYLiveModel.log("DDSESSION 保存失败 \(error.localizedDescription)") }
-    }
-
-    /// 异步写盘：把整份会话的 JSON 编码 + 落盘从调用线程（翻页热路径的主线程）挪到后台。
-    /// DYAweme 是 Sendable 值类型，主线程浅拷贝一份 items 后再后台编码，不占用主线程。
-    func saveAsync() {
-        guard items.contains(where: { $0.id == currentID }) else { return }
-        let snapshot = self
-        Self.saveQueue.async {
-            guard let data = try? JSONEncoder().encode(snapshot) else { return }
-            do { try data.write(to: Self.url, options: .atomic) }
-            catch { DYLiveModel.log("DDSESSION 保存失败 \(error.localizedDescription)") }
-        }
     }
 }
 

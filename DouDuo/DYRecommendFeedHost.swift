@@ -211,8 +211,7 @@ extension DYRecommendFeedHost {
             positions[id] = max(0, DDNowPlaying.time)
         }
         feed.noteCurrent(id, positions: positions)   // 切换界面模式后另一套根视图接手（main f76e636）
-        // 异步落盘：编码+写盘挪到后台队列，翻页那一帧主线程不再做磁盘 IO（卡顿主因之一）
-        DYFeedSession(items: feed.items, currentID: id, positions: positions).saveAsync()
+        DYFeedSession(items: feed.items, currentID: id, positions: positions).save()
     }
 
     func showToast(_ s: String) { feed.showToast(s) }

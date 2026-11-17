@@ -130,50 +130,48 @@ struct DYNativeVideoActions: View {
             }
         }
         .toolbar {
-            if !(onBack == nil ? actions == nil || showsInlineCleanControl : verticalEdge == nil) {
-                ToolbarItem(placement: .primaryAction) {
-                    Group {
-                        if let onBack { standaloneControls(onBack) }
-                        else { cleanButton }
-                    }
-                    .background(DYToolbarFrameReader { frame, height in
-                        withTransaction(Transaction(animation: nil)) {
-                            anchorFrame = frame
-                            windowHeight = height
-                        }
-                    })
+            ToolbarItem(placement: .primaryAction) {
+                Group {
+                    if let onBack { standaloneControls(onBack) }
+                    else { cleanButton }
                 }
-                .axisBehavior(.verticalPreferred)
-                .visibilityPriority(.high)
+                .background(DYToolbarFrameReader { frame, height in
+                    withTransaction(Transaction(animation: nil)) {
+                        anchorFrame = frame
+                        windowHeight = height
+                    }
+                })
             }
+            .axisBehavior(.verticalPreferred)
+            .visibilityPriority(.high)
+            .hidden(onBack == nil ? actions == nil || showsInlineCleanControl : verticalEdge == nil)
 
             // The stable controls anchor is independent of this group's size.
             // A new item identity invalidates the native cached fitting size.
-            if !(actions == nil || verticalEdge == nil || isClean) {
-                ToolbarItem(id: "video-actions-\(Int(slotHeight))-\(Int(standaloneBottomClearance))", placement: .bottomBar) {
-                    if verticalEdge != nil, let actions {
-                        VStack(spacing: 4) {
-                            DYAuthorAvatarControl(image: actions.avatarImage, name: actions.authorName,
-                                                  onAuthor: actions.onAuthor, follow: actions.follow)
-                            actions.like
-                            actions.comments
-                            actions.collect
-                            actions.share
-                        }
-                        .padding(.vertical, 5)
-                        .glassEffect(.regular, in: .capsule)
-                        .environment(\.colorScheme, .dark)
-                        .accessibilityElement(children: .contain)
-                        .accessibilityIdentifier("douyin.video.actions")
-                        .padding(.bottom, standaloneBottomClearance)
-                        .frame(height: slotHeight, alignment: .bottom)
-                        .modifier(DYHoldBoostArea(control: actions.boost))
+            ToolbarItem(id: "video-actions-\(Int(slotHeight))-\(Int(standaloneBottomClearance))", placement: .bottomBar) {
+                if verticalEdge != nil, let actions {
+                    VStack(spacing: 4) {
+                        DYAuthorAvatarControl(image: actions.avatarImage, name: actions.authorName,
+                                              onAuthor: actions.onAuthor, follow: actions.follow)
+                        actions.like
+                        actions.comments
+                        actions.collect
+                        actions.share
                     }
+                    .padding(.vertical, 5)
+                    .glassEffect(.regular, in: .capsule)
+                    .environment(\.colorScheme, .dark)
+                    .accessibilityElement(children: .contain)
+                    .accessibilityIdentifier("douyin.video.actions")
+                    .padding(.bottom, standaloneBottomClearance)
+                    .frame(height: slotHeight, alignment: .bottom)
+                    .modifier(DYHoldBoostArea(control: actions.boost))
                 }
-                .sharedBackgroundVisibility(.hidden)
-                .axisBehavior(.verticalPreferred)
-                .visibilityPriority(.high)
             }
+            .sharedBackgroundVisibility(.hidden)
+            .axisBehavior(.verticalPreferred)
+            .visibilityPriority(.high)
+            .hidden(actions == nil || verticalEdge == nil || isClean)
         }
         // Retain the last measured slot across navigation and sheets.
     }
