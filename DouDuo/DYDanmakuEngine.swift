@@ -114,10 +114,21 @@ final class DYDanmakuEngineView: UIView {
         let resumeFrom = cursor < queue.count ? queue[cursor].offset : (lastT >= 0 ? lastT : 0)
         // 新弹幕分段到达，队列本身已按 offset 排好：逐条二分插入，避免每次全量 sort（O(n log n) → O(n log k)）
         for d in fresh {
-            let idx = queue.partitioningIndex { $0.offset == d.offset ? $0.id < d.id : $0.offset < d.offset }
-            queue.insert(d, at: idx)
+            queue.insert(d, at: Self.insertionIndex(of: d, in: queue))
         }
         cursor = queue.firstIndex { $0.offset >= resumeFrom } ?? queue.count
+    }
+
+    /// 二分查找 d 应插入的位置（按 offset 升序，同 offset 按 id 升序）
+    private static func insertionIndex(of d: DYDanmaku, in queue: [DYDanmaku]) -> Int {
+        var lo = 0, hi = queue.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            let m = queue[mid]
+            let before = m.offset == d.offset ? m.id < d.id : m.offset < d.offset
+            if before { lo = mid + 1 } else { hi = mid }
+        }
+        return lo
     }
 
     /// 跳转/重新开始：清屏，从 t 往后排
