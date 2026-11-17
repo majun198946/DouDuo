@@ -216,10 +216,8 @@ final class DYMessageCache: ObservableObject {
             if batch == 0 { initialCursor = fresh.maxTime; initialMore = fresh.hasMore }
             incoming.append(contentsOf: fresh.items)
             if !fresh.hasMore || fresh.items.isEmpty || fresh.maxTime == cursor || fresh.items.contains(where: { known.contains($0.id) }) { break }
-            // 没有缓存（或缓存不足一页）时也要连拉几页：抖音单页只给 10 条，
-            // 只取首页会出现「消息中心永远只有 10 条」——老板报的「只显示 20 个人」就是这个。
-            // 首屏给到 3 页（约 30 条）够填满一屏，再往下由用户下滑分页继续。
-            if old == nil && batch >= 2 { break }
+            // 没有缓存时只取首页，历史仍由用户下滑分页获取。
+            if old == nil { break }
             cursor = fresh.maxTime
         }
         var byID = Dictionary((old?.items ?? []).map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
@@ -461,8 +459,6 @@ struct DYMessagesScreen: View {
     @State private var showChatOptions = false
     @State private var changingConversation: String?
     @State private var deletingConversation: DYConversationRow?
-    /// 长按聊天里某条消息后，网页脚本给它打的记号
-    @State private var deletingMessageToken: String?
     @State private var actionError: String?
     @State private var openedFromShare = false
     @State private var shareOpenFailed = false
@@ -595,13 +591,6 @@ struct DYMessagesScreen: View {
             }
             Button("取消", role: .cancel) { deletingConversation = nil }
         } message: { Text("会话将从消息列表移除。") }
-        .alert("删除这条消息？", isPresented: Binding(get: { deletingMessageToken != nil }, set: { if !$0 { deletingMessageToken = nil } })) {
-            Button("删除", role: .destructive) {
-                if let token = deletingMessageToken { Task { await deleteChatMessage(token) } }
-                deletingMessageToken = nil
-            }
-            Button("取消", role: .cancel) { deletingMessageToken = nil }
-        }
         .task(id: navigation.chatID) {
             guard let id = navigation.chatID else { return }
             while !Task.isCancelled, navigation.chatID == id {
@@ -642,9 +631,6 @@ struct DYMessagesScreen: View {
                 guard let data = json.data(using: .utf8),
                       let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
                 switch obj["type"] as? String {
-                case "msg-menu":
-                    guard let token = obj["token"] as? String, !token.isEmpty else { return }
-                    Task { @MainActor in self.deletingMessageToken = token }
                 case "video":
                     guard let id = obj["id"] as? String, !id.isEmpty else { return }
                     Task { @MainActor in
@@ -834,6 +820,7 @@ struct DYMessagesScreen: View {
 
     private var messageRail: some View {
         VStack(spacing: theme.media.actionGroupSpacing) {
+            Spacer(minLength: 0)
             // 返回：单独一颗圆（跟视频页从搜索进入时的返回圆钮一致）
             if (!showingMine && navigation.hasDetail) || chromeModeRaw != DDChromeMode.duoClassic.rawValue || onClose != nil {
                 Button {
@@ -884,10 +871,6 @@ struct DYMessagesScreen: View {
                     .glassEffect(.regular, in: .capsule)
             }
         }
-        // 跟视频页右侧栏同一套避让：状态栏（时间/信号环）显示时是系统遮挡区，
-        // 聊天页多一颗「更多」栏变高，返回键会顶进去被盖住。只量栏本身（不含 Spacer），
-        // 被挡住就整列往下让，最多让进底部 92pt 留白；状态栏隐藏时不动。
-        .modifier(DYRailReservedNudge(railEdge: .trailing, verticalSpace: 0...92))
         // 底部位置跟视频页一致：离底 92pt
         .padding(.bottom, 92)
         .frame(maxHeight: .infinity, alignment: .bottom)
@@ -1046,13 +1029,6 @@ struct DYMessagesScreen: View {
         conversations.sort(by: DYConversationRow.byTimeDesc)
         cache.snapshot.conversations = conversations
         cache.save()
-    }
-
-    /// 删除聊天里的一条消息：交给抖音网页自己的「删除」，没确认删掉就报出来。
-    private func deleteChatMessage(_ token: String) async {
-        guard let web = chatModel.web else { actionError = "聊天页还没准备好"; return }
-        let result = await DYChatWebBridge.deleteMessage(token: token, web: web)
-        if let failure = result?.failure ?? (result == nil ? "删除没有完成，请稍后重试" : nil) { actionError = failure }
     }
 
     private func changeConversation(_ row: DYConversationRow, action: DYChatWebBridge.Action) async {

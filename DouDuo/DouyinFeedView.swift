@@ -11,7 +11,6 @@ import SwiftUI
 import Combine
 import WebKit
 import AVFoundation
-import PhotosUI
 
 // MARK: - 数据
 
@@ -72,10 +71,6 @@ struct DYAweme: Identifiable, Codable, Equatable, Sendable {
 
     /// 视频画面高宽比，不是界面方向。界面布局看容器尺寸 / size class。
     var isTallFrame: Bool { height > width * 1.05 }
-    var videoAspect: Double {
-        guard width.isFinite, height.isFinite, width > 0, height > 0 else { return 0 }
-        return width / height
-    }
     var webURL: URL { URL(string: "https://www.douyin.com/video/\(id)")! }
 }
 
@@ -102,8 +97,6 @@ struct DYComment: Identifiable, Decodable, Equatable {
     let time: Double
     let replies: Int
     let ip: String?
-    /// 评论作者的 sec_uid，用来认出「这条是我发的」（能删）。缺字段时为空。
-    var sec: String? = nil
     /// 这条评论在账号里是否已赞。缺字段当未赞。
     var userDigged: Int? = nil
     /// 评论配图（image_list）与表情包贴纸（sticker），缺字段为空
@@ -983,6 +976,7 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
       diag: 'tab s=' + r.s + ' code=' + d.status_code + ' signed=' + /a_bogus=/.test(r.u || '') + ' raw=' + raw.length + ' kept=' + items.length + ' tall=' + tall + ' follow=' + fol });
     """#
 
+
     private static let watchJS = #"""
     const s = await req('POST', '/aweme/v2/web/aweme/stats/?' + q({}),
       new URLSearchParams({ aweme_type: type, item_id: id, source: '0', play_delta: '1' }).toString());
@@ -1015,7 +1009,7 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
       return { thumb: st.u, full: an.u, w: s.width || st.w, h: s.height || st.h };
     };
     const one = c => ({
-      id: String(c.cid), text: c.text || '', name: (c.user && c.user.nickname) || '', sec: (c.user && c.user.sec_uid) || null, avatar: c.user && first(c.user.avatar_thumb),
+      id: String(c.cid), text: c.text || '', name: (c.user && c.user.nickname) || '', avatar: c.user && first(c.user.avatar_thumb),
       digg: c.digg_count || 0, time: c.create_time || 0, replies: c.reply_comment_total || 0, ip: c.ip_label || null, userDigged: c.user_digged ? 1 : 0,
       images: ddImages(c), sticker: ddSticker(c),
       parent: (c.reply_id && String(c.reply_id) !== '0') ? String(c.reply_id) : null
@@ -1040,6 +1034,33 @@ private struct DouyinBridgeHost: UIViewRepresentable {
         return v
     }
     func updateUIView(_ uiView: UIView, context: Context) {}
+}
+
+private struct DYPlayerLayerView: UIViewRepresentable {
+    let player: AVPlayer?
+    let gravity: AVLayerVideoGravity
+    /// 首帧出来前透明（露出封面），出来后填底色盖住封面——封面是 4:3 裁图，和视频比例不一致
+    let readyFill: UIColor
+    final class V: UIView {
+        override class var layerClass: AnyClass { AVPlayerLayer.self }
+        var pl: AVPlayerLayer { layer as! AVPlayerLayer }
+        var fill: UIColor = .clear
+        private var obs: NSKeyValueObservation?
+        func watch() {
+            obs = pl.observe(\.isReadyForDisplay, options: [.initial, .new]) { [weak self] l, _ in
+                let ready = l.isReadyForDisplay
+                DispatchQueue.main.async { self?.backgroundColor = ready ? self?.fill : .clear }
+            }
+        }
+    }
+    func makeUIView(context: Context) -> V {
+        let v = V(); v.isUserInteractionEnabled = false; v.fill = readyFill; v.watch(); return v
+    }
+    func updateUIView(_ v: V, context: Context) {
+        v.fill = readyFill
+        if v.pl.player !== player { v.pl.player = player }
+        if v.pl.videoGravity != gravity { v.pl.videoGravity = gravity }
+    }
 }
 
 // MARK: - 预加载（抖音同款：提前缓冲后面几条）
@@ -1185,10 +1206,6 @@ final class DYFeedModel: ObservableObject {
     @Published var isLoggedIn = false
     private var hasMore = true
     private let defaults: UserDefaults
-    /// 切换界面模式（经典 ⇄ 默认/简洁/极简）会换一套根视图：当前条和各条进度记在模型上，
-    /// 新根视图接着播同一条，不重新拉推荐（见 handoff()）。
-    var handoffCurrentID: String?
-    var handoffPositions: [String: Double] = [:]
 
     init(defaults: UserDefaults = .standard) { self.defaults = defaults }
 
@@ -1349,52 +1366,41 @@ extension EnvironmentValues {
 }
 
 
-struct DYUpstreamFeedScreen: DYRecommendFeedHost {
-    init(bridge: DouyinBridge, feed: DYFeedModel) {
-        self.bridge = bridge
-        self.feed = feed
-        // 从另一套界面切过来：接着播同一条、同一进度
-        // 首次布局 LazyVStack 不认 scrollPosition 初值（会停在第一条），由 DYFeedPager.onAppear 显式滚到当前条。
-        let handoff = feed.handoff()
-        _resume = State(initialValue: handoff?.positions ?? [:])
-        _handoffID = State(initialValue: handoff?.currentID)
-        _currentID = State(initialValue: handoff?.currentID)
-        _scrollID = State(initialValue: handoff?.currentID)
-    }
-    @State private var handoffID: String?
-
+struct DYUpstreamFeedScreen: View {
     @State private var followCommentItem: DYAweme?
     @Environment(\.appTheme) private var theme
     @Environment(\.colorScheme) private var scheme
     @Environment(\.dismiss) private var dismiss
-    /// 签名页和推荐流由 DouyinFeedScreen 持有，两套根视图共用：切换界面模式不重新连接、不换一批视频。
-    @ObservedObject var bridge: DouyinBridge
-    @ObservedObject var feed: DYFeedModel
+    @StateObject private var bridge = DouyinBridge()
+    @StateObject private var feed = DYFeedModel()
     @AppStorage(DYHashtagFilter.storageKey) private var blockedHashtags = ""
     @Environment(\.dyHashtagFilterPresented) private var hashtagFilterPresented
     @State private var insets = EdgeInsets()
-    @State var preloader = DYPreloader()
-    @State var resume: [String: Double] = [:]
-    @State var currentID: String?
-    @State var scrollID: String?
-    @State var userScrolling = false
-    @State var scrollEndTask: Task<Void, Never>?
-    @State var initialized = false
-    @State var refreshing = false
-    @State var showComments = false
+    @State private var preloader = DYPreloader()
+    @State private var resume: [String: Double] = [:]
+    @State private var currentID: String?
+    @State private var scrollID: String?
+    @State private var userScrolling = false
+    @State private var scrollEndTask: Task<Void, Never>?
+    @State private var initialized = false
+    @State private var refreshing = false
+    @State private var showComments = false
     @State private var web: DYWebTarget?
     @State private var showSettings = false
-    @State var tab: DYTab = {
+    @State private var tab: DYTab = {
         let e = ProcessInfo.processInfo.environment
         if e["DOUDUO_STARTLIVE"] == "1" { return .live }
         if e["DOUDUO_STARTFOLLOW"] == "1" { return .follow }
         return .recommend
     }()
     @StateObject private var live = DYLiveModel()
-    @State var searchSession: DYSearchSession?
+    @State private var searchSession: DYSearchSession?
     @State private var searchIsSplit = false
     private var showSearch: Bool { searchSession != nil }
-    @State var lastFeedPull = Date.distantPast
+    private func openSearch() {
+        DYSearchSession.transition { showComments = false; searchSession = DYSearchSession() }
+    }
+    @State private var lastFeedPull = Date.distantPast
     @AppStorage(DYVideoCache.countKey) private var cacheCount = DYVideoCache.defaultCount
     @State private var showMine = false
     /// 顶栏「我的」按钮用的账号头像
@@ -1436,8 +1442,11 @@ struct DYUpstreamFeedScreen: DYRecommendFeedHost {
     private let peek = DDPeekInfo.shared
     /// 播放速度（更多 → 倍速）：全局速度，长按锁定只作用于单条视频，不写这里
     @AppStorage("douyin_playback_rate_v1") private var playbackRate = 1.0
-    @State var noticeUnread = 0
+    @State private var noticeUnread = 0
     @State private var wideToken = UUID()
+
+    private var currentIndex: Int? { currentID.flatMap { id in feed.items.firstIndex { $0.id == id } } }
+    private var current: DYAweme? { currentIndex.map { feed.items[$0] } }
 
     private var chrome: some View {
         let railMode = chromeMode.usesRail
@@ -1540,8 +1549,6 @@ struct DYUpstreamFeedScreen: DYRecommendFeedHost {
             #if DEBUG
             if ProcessInfo.processInfo.environment["DOUDUO_APISCAN"] == "1" { Task { await DYApiScanner.run(bridge) } }
             if ProcessInfo.processInfo.environment["DOUDUO_CPROBE"] == "1" { Task { await DYCommentApiProbe.run(bridge) } }
-            if ProcessInfo.processInfo.environment["DOUDUO_WEBAPI"] == "1" { Task { await DYWebApiProbe.run(bridge) } }
-            if ProcessInfo.processInfo.environment["DOUDUO_IMGUP"] == "1" { Task { await DYWebApiProbe.uploadSmoke(bridge) } }
             if ProcessInfo.processInfo.environment["DOUDUO_LOGINPROBE"] == "1" { Task { await DYLoginProbe.run(bridge) } }
             #endif
             if ProcessInfo.processInfo.environment["DOUDUO_EXPORTTEST"] == "1" { Task { await DDFeatureProbe.exportHeadProbe(bridge) } }
@@ -1561,27 +1568,19 @@ struct DYUpstreamFeedScreen: DYRecommendFeedHost {
             Task { myUser = try? await bridge.selfProfile() }
             if tab == .live { return }   // 起手就是直播页（调试）时别把推荐流的播放器都拉起来
             // 秒开：先播上次缓存好、还没看过的；连接抖音 / 拉推荐在后台接着往后补（两套界面共用 DYFeedModel.restoreForLaunch）
-            let handedOff = handoffID.map { id in feed.items.contains { $0.id == id } } ?? false
-            if handedOff, let id = handoffID {
-                // 从另一套界面切过来（init 里已接手进度）：列表原样沿用，不重排、不重新拉推荐
-                DYLiveModel.log("DDHANDOFF id=\(id.suffix(6)) at=\(String(format: "%.1f", resume[id] ?? 0)) n=\(feed.items.count)")
-                currentID = id
-                scrollID = id
-            } else {
-                if let restored = feed.restoreForLaunch() {
-                    resume = restored.positions
-                    currentID = restored.currentID
-                    scrollID = currentID
-                }
-                // 恢复的会话里「当前条之后」是上次的排法：按现在的方向 / 比例重排（当前这条不动）
-                if currentIndex != nil { feed.remix(after: currentIndex) }
-                await feed.loadMore(bridge)
-                if currentID == nil { currentID = feed.items.first?.id }
-                focusCurrent()
+            if let restored = feed.restoreForLaunch() {
+                resume = restored.positions
+                currentID = restored.currentID
+                scrollID = currentID
             }
+            // 恢复的会话里「当前条之后」是上次的排法：按现在的方向 / 比例重排（当前这条不动）
+            if currentIndex != nil { feed.remix(after: currentIndex) }
+            await feed.loadMore(bridge)
+            if currentID == nil { currentID = feed.items.first?.id }
+            focusCurrent()
             #if DEBUG
             // 用真实作品详情复验元数据显示，不造预览数据、不做账号互动。
-            if !handedOff, let id = ProcessInfo.processInfo.environment["DOUDUO_VIDEO_ID"],
+            if let id = ProcessInfo.processInfo.environment["DOUDUO_VIDEO_ID"],
                let item = try? await bridge.awemeDetail(id) {
                 feed.items = [item]; currentID = item.id; scrollID = item.id
                 focusCurrent()
@@ -1793,6 +1792,16 @@ struct DYUpstreamFeedScreen: DYRecommendFeedHost {
         tab == .recommend ? DYDuoMetrics.videoCommentPanes(geo) : nil
     }
 
+    /// 当前条之后按新的方向/比例重排；不够就接着拉
+    private func remixUpcoming() {
+        guard tab == .recommend || !feed.items.isEmpty else { return }
+        feed.remix(after: currentIndex)
+        DYLiveModel.log("DDMIX remix wide=\(feed.screenWide) upcoming=\(feed.items.count - (currentIndex ?? -1) - 1)")
+        if currentID == nil { currentID = feed.items.first?.id; scrollID = currentID }
+        lastFeedPull = .distantPast
+        focusCurrent()
+    }
+
     /// 一套布局通吃所有状态，且**不换容器**（换容器会重建播放器 → 黑屏 / 重播）：
     /// - 平放/外屏：视频铺满；够宽时评论从右侧滑出（视频缩窄），窄屏走底部 sheet
     /// - 半折叠：视频自动缩到一多半，另一半常驻评论（宽>高→左右分；高>宽→上下分）
@@ -1870,6 +1879,56 @@ struct DYUpstreamFeedScreen: DYRecommendFeedHost {
         }
     }
 
+    private func refreshNoticeUnread() async {
+        guard let groups = try? await bridge.noticeCounts() else { return }
+        noticeUnread = DYMessagesScreen.badge(groups)
+    }
+
+    /// 换条时：上一条看完没有（≥95%，网页版同口径）+ 新一条起播 1.5 秒后上报
+    private func reportWatch(old: String?, new: String?) {
+        guard let new, let item = feed.items.first(where: { $0.id == new }) else { return }
+        var seen = false
+        if let old, let prev = feed.items.first(where: { $0.id == old }), prev.duration > 0,
+           DDNowPlaying.id == old { seen = DDNowPlaying.time / prev.duration >= 0.95 }
+        Task {
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            guard currentID == new else { return }
+            await bridge.reportWatch(item, preID: old, preSeen: seen)
+        }
+    }
+
+    private func saveSession() {
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["DOUDUO_HASHTAG_FIXTURE"] == "1" { return }
+        #endif
+        guard let id = currentID, feed.items.contains(where: { $0.id == id }) else { return }
+        var positions = resume
+        if DDNowPlaying.id == id, DDNowPlaying.time.isFinite {
+            positions[id] = max(0, DDNowPlaying.time)
+        }
+        DYFeedSession(items: feed.items, currentID: id, positions: positions).save()
+    }
+
+    /// 自动连播：播完滑到下一条；快到底时先补一页
+    private func playNext(after id: String) {
+        guard let i = feed.items.firstIndex(where: { $0.id == id }) else { return }
+        if i + 1 < feed.items.count {
+            advance(from: id, to: feed.items[i + 1].id)
+        } else {
+            Task {
+                await feed.loadMore(bridge)
+                if let j = feed.items.firstIndex(where: { $0.id == id }), j + 1 < feed.items.count {
+                    advance(from: id, to: feed.items[j + 1].id)
+                }
+            }
+        }
+    }
+
+    /// 自动连播翻页带滑动动画（议题 #21-4）；分页代理没接上时退回直接切
+    private func advance(from: String, to: String) {
+        if !DYPagerAdvance.request(from: from, to: to) { withAnimation { currentID = to } }
+    }
+
     /// 点页签只切页，不再顺手刷新（点顶部会误触成「刷新视频」）。
     /// 要换一批推荐走「更多 → 刷新推荐」。
     private func selectTab(_ target: DYTab) {
@@ -1879,6 +1938,97 @@ struct DYUpstreamFeedScreen: DYRecommendFeedHost {
             liveModuleRequest = nil
         }
         tab = target
+    }
+
+    /// 先拉到新一批再替换，失败不清空当前画面；与预取互斥，避免旧请求覆盖刷新结果。
+    @MainActor private func refreshRecommendations() async {
+        guard !refreshing else { return }
+        refreshing = true
+        defer { refreshing = false; focusCurrent() }
+        showToast("正在刷新推荐…")
+        while feed.loading {
+            do { try await Task.sleep(nanoseconds: 100_000_000) }
+            catch { return }
+        }
+        guard !Task.isCancelled else { return }
+        let previous = Set(feed.items.map(\.id))
+        let replacement = DYFeedModel()
+        replacement.screenWide = feed.screenWide
+        await replacement.loadMore(bridge)
+        guard !Task.isCancelled else { return }
+        let fresh = replacement.items.filter { !previous.contains($0.id) }
+        guard !fresh.isEmpty else {
+            showToast(replacement.error ?? "暂时没有新的推荐，已保留当前视频")
+            DYLiveModel.log("DDREFRESH failed kept=\(currentID ?? "-")")
+            return
+        }
+        showComments = false
+        scrollEndTask?.cancel(); userScrolling = false
+        preloader.clear()
+        feed.reset()
+        feed.items = fresh
+        feed.pool = replacement.pool
+        feed.liked.formUnion(replacement.liked)
+        feed.collected.formUnion(replacement.collected)
+        resume = [:]
+        currentID = fresh.first?.id
+        scrollID = currentID
+        lastFeedPull = Date()
+        saveSession()
+        showToast("推荐已刷新")
+        DYLiveModel.log("DDREFRESH ok n=\(fresh.count) first=\(currentID ?? "-")")
+    }
+
+    private func applyHashtagFilter() async {
+        let previousID = currentID
+        currentID = feed.applyHashtagFilter(currentID: currentID)
+        if previousID != currentID {
+            scrollEndTask?.cancel()
+            userScrolling = false
+            showComments = false
+            scrollID = currentID
+            preloader.clear()
+        }
+        saveSession()
+        guard initialized else { return }
+        while feed.loading {
+            do { try await Task.sleep(for: .milliseconds(100)) } catch { return }
+        }
+        guard !Task.isCancelled else { return }
+        if feed.items.isEmpty { await feed.loadMore(bridge) }
+        guard !Task.isCancelled else { return }
+        if currentID == nil { currentID = feed.items.first?.id; scrollID = currentID }
+        focusCurrent()
+        saveSession()
+    }
+
+    private func focusCurrent() {
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["DOUDUO_HASHTAG_FIXTURE"] == "1" { return }
+        #endif
+        guard !refreshing, let i = currentIndex else { return }
+        preloader.update(feed.items, current: i)
+        // 不再预解首帧：界面已不用首帧图顶替（老板要纯黑直出），省 CPU 和解码
+        let curID = feed.items[i].id
+        let ahead = Array(feed.items.dropFirst(i + 1))
+        let currentItem = feed.items[i]
+        Task {
+            await DYVideoCache.shared.markWatched(curID)
+            await DYVideoCache.shared.focus(current: currentItem, ahead: ahead)
+        }
+        // 后面不足「缓存条数」就继续拉推荐（至少保证 6 条，节流 4 秒一次）
+        let want = max(6, min(DYVideoCache.limit, 60))
+        if feed.items.count - i - 1 < want, Date().timeIntervalSince(lastFeedPull) > 4 {
+            lastFeedPull = Date()
+            Task {
+                await feed.loadMore(bridge)
+                if let j = currentIndex {
+                    preloader.update(feed.items, current: j)
+                    await DYVideoCache.shared.focus(current: feed.items[j], ahead: Array(feed.items.dropFirst(j + 1)))
+                    if feed.items.count - j - 1 < want { focusCurrent() }
+                }
+            }
+        }
     }
 
     @ViewBuilder
@@ -1915,7 +2065,6 @@ struct DYUpstreamFeedScreen: DYRecommendFeedHost {
             Text(String(format: "%g", playbackRate)).font(.caption2).opacity(0.01)
                 .accessibilityIdentifier("douyin.rate")
                 .allowsHitTesting(false)
-            DYRefreshProbeAnchor()
             #endif
         }
         // 顶栏要压在系统状态栏那一行，所以整块忽略顶部安全区；
@@ -1974,7 +2123,7 @@ struct DYUpstreamFeedScreen: DYRecommendFeedHost {
         // 触摸区左右各扩 hPad、上下各扩 14（图标与字号不动）
         HStack(spacing: spacing) {
             ForEach(DYTab.allCases, id: \.self) { t in
-                Button { tapChannel(t, switchTab: selectTab) } label: {
+                Button { selectTab(t) } label: {
                     VStack(spacing: 3) {
                         Text(t.title)
                             .font(.headline.weight(tab == t ? .bold : .medium))
@@ -1991,8 +2140,6 @@ struct DYUpstreamFeedScreen: DYRecommendFeedHost {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .accessibilityIdentifier("douyin.channel.\(t == .follow ? "follow" : t == .recommend ? "recommend" : "live")")
-                .accessibilityValue(t == .recommend && refreshing ? "正在刷新" : tab == t ? "已选择" : "")
             }
             // 消息只留图标，未读红点仍独立显示。
             Button { showMessages = true } label: {
@@ -2091,6 +2238,40 @@ struct DYUpstreamFeedScreen: DYRecommendFeedHost {
                            fg: theme.media.onMedia.color(for: scheme))
     }
 
+    /// 模块菜单的内容（单击圆形入口时弹出）。
+    @ViewBuilder
+    private var moduleMenuContent: some View {
+        Section("切换模块") {
+            Picker("当前模块", selection: Binding(get: { tab }, set: { selectTab($0) })) {
+                ForEach(DYTab.allCases, id: \.self) { target in
+                    Label(target.title, systemImage: target.symbol)
+                        .tag(target)
+                }
+            }
+            .pickerStyle(.inline)
+        }
+        if tab == .live {
+            Section {
+                Button("我的关注", systemImage: "person.2") {
+                    queuedLiveAction = .followedLive
+                    publishQueuedLiveModule()
+                }
+                .accessibilityIdentifier("douyin.module.live.follow")
+                Button("发现更多", systemImage: "square.grid.2x2") {
+                    queuedLiveAction = .discover
+                    publishQueuedLiveModule()
+                }
+                .accessibilityIdentifier("douyin.module.live.discover")
+            }
+        }
+        Section {
+            Button("搜索", systemImage: "magnifyingglass") { openSearch() }
+                .accessibilityIdentifier("douyin.module.search")
+            // 信息与我的已合成一页（右侧栏切换）：菜单只留一个入口「我的」
+            Button("我的", systemImage: "person.crop.circle") { showMessages = true }
+        }
+    }
+
     /// 圆形模块入口（简洁 / 极简共用）。
     /// 系统 Menu 在长按时也会弹出菜单，没法做到「长按只看作者标题、不弹菜单」，所以统一自己处理：
     /// 单击（按下不满 0.35 秒）弹菜单，长按（满 0.35 秒）显示作者标题，松手消失，不弹菜单。
@@ -2173,10 +2354,8 @@ struct DYUpstreamFeedScreen: DYRecommendFeedHost {
                      arrowEdge: opensUpward ? .bottom : (edge == .trailing ? .trailing : .leading)) {
                 VStack(alignment: .leading, spacing: 0) {
                     ForEach(DYTab.allCases, id: \.self) { target in
-                        minimalMenuRow(target == .recommend && tab == .recommend ? "刷新推荐" : target.title,
-                                       target == .recommend && tab == .recommend ? "arrow.clockwise" : target.symbol,
-                                       selected: tab == target, id: "douyin.module.item.\(target)") {
-                            tapChannel(target, switchTab: selectTab)
+                        minimalMenuRow(target.title, target.symbol, selected: tab == target, id: "douyin.module.item.\(target)") {
+                            selectTab(target)
                         }
                     }
                     if tab == .live {
@@ -2294,7 +2473,45 @@ struct DYUpstreamFeedScreen: DYRecommendFeedHost {
                            onEnded: { playNext(after: item.id) })
     }
 
+    /// 点赞：先本地乐观更新，再调抖音网页接口，按服务端返回决定成败
+    /// （不用 cookie 判断登录态：sessionid 是 HttpOnly，document.cookie 读不到，会误判成未登录）
+    private func toggleLike(_ id: String, force: Bool?) { feed.toggleLike(id, force: force, bridge: bridge) }
+
+
+    /// 不感兴趣：立刻从列表拿掉并切到下一条，后台告诉抖音（失败只提示，不把视频塞回来）
+    private func dislike(_ id: String) {
+        guard let i = feed.items.firstIndex(where: { $0.id == id }) else { return }
+        let next = i + 1 < feed.items.count ? feed.items[i + 1].id : (i > 0 ? feed.items[i - 1].id : nil)
+        scrollEndTask?.cancel(); userScrolling = false
+        showComments = false
+        if currentID == id { currentID = next; scrollID = next }
+        feed.items.remove(at: i)
+        resume[id] = nil
+        saveSession()
+        showToast("将减少此类推荐")
+        Task {
+            await DYVideoCache.shared.markWatched(id)
+            do {
+                switch try await bridge.dislike(id) {
+                case .ok: break
+                case .notLoggedIn: showToast("抖音未登录，「不感兴趣」没同步到账号")
+                case .failed(let why): showToast("「不感兴趣」同步失败：\(why)")
+                }
+            } catch {
+                showToast("「不感兴趣」同步失败：\(error.localizedDescription)")
+            }
+        }
+        if next == nil { Task { await feed.loadMore(bridge); currentID = feed.items.first?.id; scrollID = currentID } }
+    }
+
+    /// 收藏 / 取消收藏（同步到抖音账号的「收藏」）
+    private func toggleCollect(_ id: String) { feed.toggleCollect(id, bridge: bridge) }
+
+
     private func rateTitle(_ r: Double) -> String { r == 1 ? "正常速度" : String(format: "%g 倍速", r) }
+
+    private func showToast(_ s: String) { feed.showToast(s) }
+
 
     /// 「更多」最后一节：设置（点进完整设置页）。刷新推荐 / 弹幕 / 界面都在设置页里。
     @ViewBuilder
@@ -2303,6 +2520,7 @@ struct DYUpstreamFeedScreen: DYRecommendFeedHost {
     }
 
 }
+
 
 struct DYWebTarget: Identifiable { let id = UUID(); let url: URL }
 
@@ -2573,24 +2791,14 @@ struct DYVideoPage: View {
     }
 }
 
-/// 签名页 + 推荐流：挂在 DouyinFeedScreen 上，经典与默认/简洁/极简两套根视图共用。
-/// 以前两套根视图各建一份，切换界面模式等于重新启动一次推荐流（换一批视频、进度丢失）。
-/// 不带 @Published：外层不需要跟着推荐流的变化重算。
-@MainActor
-final class DYFeedShared: ObservableObject {
-    let bridge = DouyinBridge()
-    let feed = DYFeedModel()
-}
-
 struct DouyinFeedScreen: View {
     @AppStorage(DDChromeMode.key) private var chromeModeRaw = DDChromeMode.classic.rawValue
-    @StateObject private var shared = DYFeedShared()
     var body: some View {
         Group {
             if #available(iOS 27.1, *), chromeModeRaw == DDChromeMode.duoClassic.rawValue {
-                DYClassicFeedScreen(bridge: shared.bridge, feed: shared.feed)
+                DYClassicFeedScreen()
             } else {
-                DYUpstreamFeedScreen(bridge: shared.bridge, feed: shared.feed)
+                DYUpstreamFeedScreen()
             }
         }
         .modifier(DYHashtagFilterPresentation())
@@ -2605,58 +2813,43 @@ extension EnvironmentValues {
 }
 
 @available(iOS 27.1, *)
-struct DYClassicFeedScreen: DYRecommendFeedHost {
-    init(bridge: DouyinBridge, feed: DYFeedModel) {
-        self.bridge = bridge
-        self.feed = feed
-        // 从另一套界面切过来：接着播同一条、同一进度
-        // 首次布局 LazyVStack 不认 scrollPosition 初值（会停在第一条），由 DYFeedPager.onAppear 显式滚到当前条。
-        let handoff = feed.handoff()
-        _resume = State(initialValue: handoff?.positions ?? [:])
-        _handoffID = State(initialValue: handoff?.currentID)
-        _currentID = State(initialValue: handoff?.currentID)
-        _scrollID = State(initialValue: handoff?.currentID)
-    }
-    @State private var handoffID: String?
-
+struct DYClassicFeedScreen: View {
     @AppStorage("douyin_muted_v1") private var muted = false
     @AppStorage("douyin_bg_play_v1") private var bgPlay = false
     @AppStorage("douyin_autoplay_v1") private var autoNext = false
     @AppStorage(DYVideoFit.preferenceKey) private var autoFit = true
     @Environment(\.appTheme) private var theme
     @Environment(\.colorScheme) private var scheme
-    /// 签名页和推荐流由 DouyinFeedScreen 持有，两套根视图共用：切换界面模式不重新连接、不换一批视频。
-    @ObservedObject var bridge: DouyinBridge
-    @ObservedObject var feed: DYFeedModel
+    @StateObject private var bridge = DouyinBridge()
+    @StateObject private var feed = DYFeedModel()
     @AppStorage(DYHashtagFilter.storageKey) private var blockedHashtags = ""
     @Environment(\.dyHashtagFilterPresented) private var hashtagFilterPresented
     @State private var insets = EdgeInsets()
-    @State var preloader = DYPreloader()
-    @State var resume: [String: Double] = [:]
-    @State var currentID: String?
-    @State var scrollID: String?
-    @State var userScrolling = false
-    @State var scrollEndTask: Task<Void, Never>?
-    @State var initialized = false
-    @State var refreshing = false
-    @Environment(\.dyStacksLandscapeComments) private var stacksLandscapeComments
-    @Environment(\.dyDuoLandscapeWindow) private var duoLandscapeWindow
-    @Environment(\.dyHingeClosed) private var hingeClosed
-    @State var showComments = false
-    @State private var captionItem: DYAweme?
+    @State private var preloader = DYPreloader()
+    @State private var resume: [String: Double] = [:]
+    @State private var currentID: String?
+    @State private var scrollID: String?
+    @State private var userScrolling = false
+    @State private var scrollEndTask: Task<Void, Never>?
+    @State private var initialized = false
+    @State private var refreshing = false
+    @State private var showComments = false
     @State private var web: DYWebTarget?
     @State private var showSettings = false
-    @State var tab: DYTab = {
+    @State private var tab: DYTab = {
         let e = ProcessInfo.processInfo.environment
         if e["DOUDUO_STARTLIVE"] == "1" { return .live }
         if e["DOUDUO_STARTFOLLOW"] == "1" { return .follow }
         return .recommend
     }()
     @StateObject private var live = DYLiveModel()
-    @State var searchSession: DYSearchSession?
+    @State private var searchSession: DYSearchSession?
     @State private var searchIsSplit = false
     private var showSearch: Bool { searchSession != nil }
-    @State var lastFeedPull = Date.distantPast
+    private func openSearch() {
+        DYSearchSession.transition { showComments = false; searchSession = DYSearchSession() }
+    }
+    @State private var lastFeedPull = Date.distantPast
     @AppStorage(DYVideoCache.countKey) private var cacheCount = DYVideoCache.defaultCount
     /// 当前大页（首页/消息/我的/直播）持久化：
     /// 以前是 @State + SwiftUI 的 TabView 选中态，重启后系统把界面恢复到「消息」，但代码里还是「首页」，
@@ -2667,10 +2860,7 @@ struct DYClassicFeedScreen: DYRecommendFeedHost {
         nonmutating set { mainTabRaw = newValue.rawValue }
     }
     private var mainTabSelection: Binding<DYMainTab> {
-        Binding(get: { mainTab }, set: { selected in
-            guard selected != mainTab else { return }
-            mainTab = selected
-        })
+        Binding(get: { mainTab }, set: { mainTabRaw = $0.rawValue })
     }
     @State private var forwardedChat: DYForwardReceipt?
     @State private var visibleVideo: DYAweme?
@@ -2701,55 +2891,35 @@ struct DYClassicFeedScreen: DYRecommendFeedHost {
     private var overlayOpen: Bool { hashtagFilterPresented || (showSearch && (!searchIsSplit || searchSession?.presentsVideo == true)) || showMine || showMessages || authorWorkOpen || (authorTarget != nil && !supportsSidePanel) }
     /// 全局播放速度；长按临时倍速不修改持久化偏好。
     @AppStorage("douyin_playback_rate_v1") private var playbackRate = 1.0
-    @State var noticeUnread = 0
+    @State private var noticeUnread = 0
     @State private var wideToken = UUID()
     @State private var topChrome = CGRect.zero
     /// Duo 横置（合屏外屏或完全展开内屏；半折不算）。
     @State private var duoLandscape = false
     private var titleCentersOnScreen: Bool { duoLandscape && !sidePanelOpen }
     @State private var supportsSidePanel = false
-    @State private var measuredSidePanel = false
     @State private var residentComments = false
-    @State private var bookFoldComments = false
     private var liveRoomOpen: Bool { tab == .live && live.entered }
-    private var sidePanelOpen: Bool {
-        !showSearch && (residentComments || (supportsSidePanel && (authorTarget != nil || (showComments && !presentsLandscapeComments))))
-    }
+    private var sidePanelOpen: Bool { !showSearch && (residentComments || (supportsSidePanel && (authorTarget != nil || showComments))) }
     private var hidesVideoChrome: Bool { (!showSearch && (showComments || residentComments || authorTarget != nil)) || liveRoomOpen }
-    private var innerPortrait: Bool { stacksLandscapeComments && !hingeClosed }
-    private var compactDuoHeader: Bool { hingeClosed || innerPortrait }
-    private var anchorsHeaderToWindow: Bool { horizontalCommentStatus || compactDuoHeader }
-
-    @State private var contentTopInset: CGFloat = 0
-    @State private var compactHeaderInsets = EdgeInsets()
     private var headerTopInset: CGFloat {
-        max(DYDuoMetrics.windowSafeTop, DYDuoMetrics.isDuoHardware ? 0 : contentTopInset, 8)
+        // NavigationStack's inset includes a horizontal toolbar after rotation.
+        // The fixed video header needs only the physical window's safe area.
+        let physicalTop = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap(\.windows).first(where: \.isKeyWindow)?.safeAreaInsets.top ?? 0
+        return max(physicalTop, 8)
     }
 
-    private var commentAweme: DYAweme? { (tab == .follow ? visibleVideo : current) ?? captionItem }
-    private var horizontalCommentStatus: Bool {
-        (bookFoldComments || (duoLandscapeWindow && showComments))
-            && !showSearch && authorTarget == nil && tab != .live && commentAweme != nil
-    }
-
-    private var hidesCommentStatus: Bool {
-        (hingeClosed || stacksLandscapeComments) && showComments && !showSearch
-            && authorTarget == nil && tab != .live && commentAweme != nil
-    }
-
-    private var presentsLandscapeComments: Bool {
-        showComments && !showSearch && authorTarget == nil && tab != .live
-            && DYInlineCommentPlacement.applies(to: commentAweme, enabled: stacksLandscapeComments)
-    }
+    private var currentIndex: Int? { currentID.flatMap { id in feed.items.firstIndex { $0.id == id } } }
+    private var current: DYAweme? { currentIndex.map { feed.items[$0] } }
+    private var commentAweme: DYAweme? { tab == .follow ? visibleVideo : current }
 
     var body: some View {
         systemTabs
         .modifier(DYSearchPresentation(bridge: bridge, session: $searchSession, isSplit: $searchIsSplit,
                                       onOpen: { showComments = false }))
-        .onChange(of: showComments) { _, shown in
-            if shown { searchSession = nil }
-            else { captionItem = nil }
-        }
+        .onChange(of: showComments) { _, shown in if shown { searchSession = nil } }
         .background(DouyinBridgeHost(bridge: bridge).frame(width: 1, height: 1).allowsHitTesting(false))
         .task {
             guard !initialized else { return }
@@ -2771,8 +2941,6 @@ struct DYClassicFeedScreen: DYRecommendFeedHost {
             #if DEBUG
             if ProcessInfo.processInfo.environment["DOUDUO_APISCAN"] == "1" { Task { await DYApiScanner.run(bridge) } }
             if ProcessInfo.processInfo.environment["DOUDUO_CPROBE"] == "1" { Task { await DYCommentApiProbe.run(bridge) } }
-            if ProcessInfo.processInfo.environment["DOUDUO_WEBAPI"] == "1" { Task { await DYWebApiProbe.run(bridge) } }
-            if ProcessInfo.processInfo.environment["DOUDUO_IMGUP"] == "1" { Task { await DYWebApiProbe.uploadSmoke(bridge) } }
             if ProcessInfo.processInfo.environment["DOUDUO_LOGINPROBE"] == "1" { Task { await DYLoginProbe.run(bridge) } }
             #endif
             if ProcessInfo.processInfo.environment["DOUDUO_EXPORTTEST"] == "1" { Task { await DDFeatureProbe.exportHeadProbe(bridge) } }
@@ -2791,27 +2959,19 @@ struct DYClassicFeedScreen: DYRecommendFeedHost {
             #endif
             if tab == .live { return }   // 起手就是直播页（调试）时别把推荐流的播放器都拉起来
             // 秒开：先播上次缓存好、还没看过的；连接抖音 / 拉推荐在后台接着往后补（两套界面共用 DYFeedModel.restoreForLaunch）
-            let handedOff = handoffID.map { id in feed.items.contains { $0.id == id } } ?? false
-            if handedOff, let id = handoffID {
-                // 从另一套界面切过来（init 里已接手进度）：列表原样沿用，不重排、不重新拉推荐
-                DYLiveModel.log("DDHANDOFF id=\(id.suffix(6)) at=\(String(format: "%.1f", resume[id] ?? 0)) n=\(feed.items.count)")
-                currentID = id
-                scrollID = id
-            } else {
-                if let restored = feed.restoreForLaunch() {
-                    resume = restored.positions
-                    currentID = restored.currentID
-                    scrollID = currentID
-                }
-                // 恢复的会话里「当前条之后」是上次的排法：按现在的方向 / 比例重排（当前这条不动）
-                if currentIndex != nil { feed.remix(after: currentIndex) }
-                await feed.loadMore(bridge)
-                if currentID == nil { currentID = feed.items.first?.id }
-                focusCurrent()
+            if let restored = feed.restoreForLaunch() {
+                resume = restored.positions
+                currentID = restored.currentID
+                scrollID = currentID
             }
+            // 恢复的会话里「当前条之后」是上次的排法：按现在的方向 / 比例重排（当前这条不动）
+            if currentIndex != nil { feed.remix(after: currentIndex) }
+            await feed.loadMore(bridge)
+            if currentID == nil { currentID = feed.items.first?.id }
+            focusCurrent()
             #if DEBUG
             // 用真实作品详情复验元数据显示，不造预览数据、不做账号互动。
-            if !handedOff, let id = ProcessInfo.processInfo.environment["DOUDUO_VIDEO_ID"],
+            if let id = ProcessInfo.processInfo.environment["DOUDUO_VIDEO_ID"],
                let item = try? await bridge.awemeDetail(id) {
                 feed.items = [item]; currentID = item.id; scrollID = item.id
                 focusCurrent()
@@ -2975,23 +3135,17 @@ struct DYClassicFeedScreen: DYRecommendFeedHost {
             Tab("首页", systemImage: "house", value: DYMainTab.home) {
                 NavigationStack {
                     layoutRoot
-                        .ignoresSafeArea(.container, edges: presentsLandscapeComments ? [.top, .horizontal]
-                                         : hidesCommentStatus ? .horizontal : [])
                         .coordinateSpace(.named("douduo.feed"))
                         .environment(\.duoSystemBars, true)
-                        .environment(\.duoInlineVideoNavigation, sidePanelOpen || hidesCommentStatus)
+                        .environment(\.duoInlineVideoNavigation, sidePanelOpen)
                         .environment(\.duoVisibleVideo, $visibleVideo)
                         .environment(\.duoCleanScreen, cleanScreen)
                         .overlayPreferenceValue(DYActiveVideoActionsKey.self) { actions in
                             DYNativeVideoActions(actions: hidesVideoChrome ? nil : actions,
                                                  isClean: cleanScreen,
-                                                 onToggleClean: { cleanScreen.toggle() },
-                                                 inlineTopInset: headerTopInset)
-                                .id(horizontalCommentStatus || hidesCommentStatus)
+                                                 onToggleClean: { cleanScreen.toggle() })
                         }
-                        // Non-folding devices use the custom header. An empty native
-                        // navigation bar would intercept its taps and cover Search.
-                        .toolbarVisibility(liveRoomOpen || !DYDuoMetrics.isDuoHardware ? .hidden : .visible, for: .navigationBar)
+                        .toolbarVisibility(liveRoomOpen ? .hidden : .visible, for: .navigationBar)
                         .toolbarBackgroundVisibility(.hidden, for: .navigationBar, .bottomBar)
                         .toolbarColorScheme(.dark, for: .navigationBar, .bottomBar)
                         .toolbarMinimizationBehavior(.never, for: .navigationBar)
@@ -3000,8 +3154,6 @@ struct DYClassicFeedScreen: DYRecommendFeedHost {
                         // sheets too, so dismissing comments does not restore
                         // a previously expanded tab picker over the video rail.
                         .modifier(DYSystemTabBar(hidden: hidesVideoChrome || cleanScreen))
-                        .modifier(DYCommentBarPolicy(hidesStatus: hidesCommentStatus,
-                                                     usesHorizontalStatus: horizontalCommentStatus))
                 }
                 .tint(nil)
             }
@@ -3014,8 +3166,7 @@ struct DYClassicFeedScreen: DYRecommendFeedHost {
         // existing default tint; explicitly styled buttons keep their colors.
         .tint(theme.accent.color(for: scheme))
         .toolbarColorScheme(mainTab == .home ? .dark : nil, for: .tabBar)
-        // The tab container owns the system status bar when the toolbar axis changes.
-        .dyCommentStatusVisibility(hidden: mainTab == .home && hidesCommentStatus)
+        .toolbarVisibility(.visible, for: .statusBar)
         .onChange(of: mainTab) { old, selected in
             saveSession()
             if selected != .home { DDPlayback.shared.pauseAll(reason: .cover) }
@@ -3035,26 +3186,11 @@ struct DYClassicFeedScreen: DYRecommendFeedHost {
         GeometryReader { geo in
             let wide = Self.playAreaIsWide(geo)
             flatArrangement(geo)
-                .onAppear { feed.screenWide = wide }
-                .onChange(of: geo.safeAreaInsets, initial: true) { _, value in
-                    insets = value
-                    if !showComments { compactHeaderInsets = value }
-                }
-                .onGeometryChange(for: CGFloat.self) { proxy in
-                    max(proxy.frame(in: .global).minY, proxy.safeAreaInsets.top)
-                } action: { contentTopInset = $0 }
+                .onAppear { feed.screenWide = wide; insets = geo.safeAreaInsets }
+                .onChange(of: geo.safeAreaInsets) { _, value in insets = value }
                 .onGeometryChange(for: Bool.self) { proxy in
                     proxy.size.width >= DYDuoMetrics.legacyWideMin || (DYDuoMetrics.foldIsActive(proxy) && proxy.size.width > proxy.size.height)
-                } action: { measuredSidePanel = $0 }
-                // The author page owns the work's full-screen cover. Keep that
-                // exact presenter mounted during a fold, then move the author
-                // page only after the user dismisses the work.
-                .onChange(of: measuredSidePanel, initial: true) { _, measured in
-                    if !authorWorkOpen { supportsSidePanel = measured }
-                }
-                .onChange(of: authorWorkOpen) { _, open in
-                    if !open { supportsSidePanel = measuredSidePanel }
-                }
+                } action: { supportsSidePanel = $0 }
                 .onGeometryChange(for: Bool.self) { proxy in
                     DYDuoMetrics.isDuoHardware && !DYDuoMetrics.foldIsActive(proxy) && proxy.size.width > proxy.size.height
                 } action: { duoLandscape = $0 }
@@ -3068,12 +3204,6 @@ struct DYClassicFeedScreen: DYRecommendFeedHost {
                     }
                 }
         }
-        .environment(\.dyExpandedCaptionID, captionItem == nil ? nil : commentAweme?.id)
-        .environment(\.dyExpandVideoCaption, { item in
-            authorTarget = nil
-            captionItem = item
-            showComments = true
-        })
     }
 
     /// 播放区是不是横的：平放/单屏看整个窗口；半折叠看视频实际占的那块
@@ -3088,19 +3218,22 @@ struct DYClassicFeedScreen: DYRecommendFeedHost {
         return w > h ? (w * 0.55 > h) : false
     }
 
+    /// 当前条之后按新的方向/比例重排；不够就接着拉
+    private func remixUpcoming() {
+        guard tab == .recommend || !feed.items.isEmpty else { return }
+        feed.remix(after: currentIndex)
+        DYLiveModel.log("DDMIX remix wide=\(feed.screenWide) upcoming=\(feed.items.count - (currentIndex ?? -1) - 1)")
+        if currentID == nil { currentID = feed.items.first?.id; scrollID = currentID }
+        lastFeedPull = .distantPast
+        focusCurrent()
+    }
+
     /// 一套布局通吃所有状态，且**不换容器**（换容器会重建播放器 → 黑屏 / 重播）：
     /// - 平放/外屏：视频铺满；够宽时评论从右侧滑出（视频缩窄），窄屏走底部 sheet
     /// - 半折叠：视频自动缩到一多半，另一半常驻评论（宽>高→左右分；高>宽→上下分）
     private func flatArrangement(_ geo: GeometryProxy) -> some View {
-        let placement = showComments && !showSearch && authorTarget == nil && tab != .live
-            ? DYInlineCommentPlacement(geo, aweme: commentAweme, enabled: stacksLandscapeComments,
-                                       showsCaption: captionItem != nil, usesCompactPanel: stacksLandscapeComments)
-            : nil
-        let showsAuthorPane = supportsSidePanel && authorTarget != nil
-        let layout = DYCommentPaneMetrics(geo, isPresented: !showSearch && (showsAuthorPane || (showComments && placement == nil)),
-                                          allowsResident: !showSearch && tab != .live,
-                                          paneFraction: showsAuthorPane ? 0.5 : nil,
-                                          keepsSideBySide: showsAuthorPane && authorWorkOpen)
+        let layout = DYCommentPaneMetrics(geo, isPresented: !showSearch && (authorTarget != nil || showComments),
+                                          allowsResident: !showSearch && tab != .live, paneFraction: authorTarget == nil ? nil : 0.5)
         let w = geo.size.width, h = geo.size.height
 
         return ZStack(alignment: .topLeading) {
@@ -3108,7 +3241,7 @@ struct DYClassicFeedScreen: DYRecommendFeedHost {
                 .frame(width: layout.videoSize.width, height: layout.videoSize.height, alignment: .topLeading)
             if layout.showsPane {
                 Group {
-                    if showsAuthorPane, let author = authorTarget {
+                    if let author = authorTarget {
                         DYAuthorScreen(bridge: bridge, author: author,
                                        onWeb: { web = DYWebTarget(url: $0) },
                                        onClose: { withAnimation(.snappy) { authorTarget = nil } },
@@ -3117,14 +3250,11 @@ struct DYClassicFeedScreen: DYRecommendFeedHost {
                             .id(author.id)
                     } else if let cur = commentAweme {
                         DYCommentPanel(bridge: bridge, aweme: cur,
-                                       onClose: layout.resident && captionItem == nil ? nil : { showComments = false },
-                                       fillsPane: true,
-                                       trailingInset: horizontalCommentStatus ? geo.safeAreaInsets.trailing : layout.trailingInset,
-                                       horizontalStatus: horizontalCommentStatus)
+                                       onClose: layout.resident ? nil : { withAnimation(.snappy) { showComments = false } },
+                                       fillsPane: true, trailingInset: layout.trailingInset)
                             .id(cur.id)
                     }
                 }
-                .padding(.top, !DYDuoMetrics.isDuoHardware && layout.sideBySide ? DYDuoMetrics.windowSafeTop : 0)
                 .frame(width: layout.paneSize.width, height: layout.paneSize.height)
                 .clipped()
                 .dyDeskLight(layout.resident && !layout.sideBySide && authorTarget == nil)
@@ -3137,32 +3267,69 @@ struct DYClassicFeedScreen: DYRecommendFeedHost {
         }
         .frame(width: w, height: h, alignment: .topLeading)
         .onChange(of: layout.resident, initial: true) { _, resident in residentComments = resident }
-        .onChange(of: layout.resident && layout.sideBySide, initial: true) { _, bookFold in
-            bookFoldComments = bookFold
-        }
         .background((layout.resident ? Color.black : theme.media.strongScrim.color(for: scheme)).ignoresSafeArea())
         .animation(showSearch ? nil : .snappy, value: layout.resident)
-        .animation(!showSearch && layout.sideBySide ? .snappy : nil, value: showComments)
+        .animation(showSearch ? nil : .snappy, value: showComments)
         .animation(showSearch ? nil : .snappy, value: authorTarget?.id)
-        .modifier(DYInlineCommentOverlay(placement: placement, bridge: bridge, aweme: commentAweme,
-                                                  onClose: { showComments = false }))
-        .dyBottomSheet(isPresented: Binding(
-            get: { !showSearch && showComments && placement == nil && !layout.sideBySide && !layout.resident },
-            set: { if placement == nil && !supportsSidePanel && !layout.resident { showComments = $0 } }
-        ), kind: .comments, hidesStatusBar: hidesCommentStatus) {
+        .dyBottomSheet(isPresented: Binding(get: { !showSearch && showComments && !layout.sideBySide && !layout.resident }, set: { if !supportsSidePanel && !layout.resident { showComments = $0 } }), kind: .comments) {
             if let cur = commentAweme {
                 DYCommentSheet(bridge: bridge, aweme: cur, onClose: { showComments = false })
             }
         }
     }
 
-    /// Only an explicit tap on the selected recommendation channel refreshes.
-    /// Swipes and programmatic channel selection preserve the current video.
-    private func tapChannel(_ target: DYTab) {
-        guard !channelSettling else { return }
-        tapChannel(target, switchTab: selectTab)
+    private func refreshNoticeUnread() async {
+        guard let groups = try? await bridge.noticeCounts() else { return }
+        noticeUnread = DYMessagesScreen.badge(groups)
     }
 
+    /// 换条时：上一条看完没有（≥95%，网页版同口径）+ 新一条起播 1.5 秒后上报
+    private func reportWatch(old: String?, new: String?) {
+        guard let new, let item = feed.items.first(where: { $0.id == new }) else { return }
+        var seen = false
+        if let old, let prev = feed.items.first(where: { $0.id == old }), prev.duration > 0,
+           DDNowPlaying.id == old { seen = DDNowPlaying.time / prev.duration >= 0.95 }
+        Task {
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            guard currentID == new else { return }
+            await bridge.reportWatch(item, preID: old, preSeen: seen)
+        }
+    }
+
+    private func saveSession() {
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["DOUDUO_HASHTAG_FIXTURE"] == "1" { return }
+        #endif
+        guard let id = currentID, feed.items.contains(where: { $0.id == id }) else { return }
+        var positions = resume
+        if DDNowPlaying.id == id, DDNowPlaying.time.isFinite {
+            positions[id] = max(0, DDNowPlaying.time)
+        }
+        DYFeedSession(items: feed.items, currentID: id, positions: positions).save()
+    }
+
+    /// 自动连播：播完滑到下一条；快到底时先补一页
+    private func playNext(after id: String) {
+        guard let i = feed.items.firstIndex(where: { $0.id == id }) else { return }
+        if i + 1 < feed.items.count {
+            advance(from: id, to: feed.items[i + 1].id)
+        } else {
+            Task {
+                await feed.loadMore(bridge)
+                if let j = feed.items.firstIndex(where: { $0.id == id }), j + 1 < feed.items.count {
+                    advance(from: id, to: feed.items[j + 1].id)
+                }
+            }
+        }
+    }
+
+    /// 自动连播翻页带滑动动画（议题 #21-4）；分页代理没接上时退回直接切
+    private func advance(from: String, to: String) {
+        if !DYPagerAdvance.request(from: from, to: to) { withAnimation { currentID = to } }
+    }
+
+    /// 点页签只切页，不再顺手刷新（点顶部会误触成「刷新视频」）。
+    /// 要换一批推荐走「更多 → 刷新推荐」。
     private func selectTab(_ target: DYTab) {
         guard tab != target, !channelSettling else { return }
         showComments = false
@@ -3265,6 +3432,97 @@ struct DYClassicFeedScreen: DYRecommendFeedHost {
         }
     }
 
+    /// 先拉到新一批再替换，失败不清空当前画面；与预取互斥，避免旧请求覆盖刷新结果。
+    @MainActor private func refreshRecommendations() async {
+        guard !refreshing else { return }
+        refreshing = true
+        defer { refreshing = false; focusCurrent() }
+        showToast("正在刷新推荐…")
+        while feed.loading {
+            do { try await Task.sleep(nanoseconds: 100_000_000) }
+            catch { return }
+        }
+        guard !Task.isCancelled else { return }
+        let previous = Set(feed.items.map(\.id))
+        let replacement = DYFeedModel()
+        replacement.screenWide = feed.screenWide
+        await replacement.loadMore(bridge)
+        guard !Task.isCancelled else { return }
+        let fresh = replacement.items.filter { !previous.contains($0.id) }
+        guard !fresh.isEmpty else {
+            showToast(replacement.error ?? "暂时没有新的推荐，已保留当前视频")
+            DYLiveModel.log("DDREFRESH failed kept=\(currentID ?? "-")")
+            return
+        }
+        showComments = false
+        scrollEndTask?.cancel(); userScrolling = false
+        preloader.clear()
+        feed.reset()
+        feed.items = fresh
+        feed.pool = replacement.pool
+        feed.liked.formUnion(replacement.liked)
+        feed.collected.formUnion(replacement.collected)
+        resume = [:]
+        currentID = fresh.first?.id
+        scrollID = currentID
+        lastFeedPull = Date()
+        saveSession()
+        showToast("推荐已刷新")
+        DYLiveModel.log("DDREFRESH ok n=\(fresh.count) first=\(currentID ?? "-")")
+    }
+
+    private func applyHashtagFilter() async {
+        let previousID = currentID
+        currentID = feed.applyHashtagFilter(currentID: currentID)
+        if previousID != currentID {
+            scrollEndTask?.cancel()
+            userScrolling = false
+            showComments = false
+            scrollID = currentID
+            preloader.clear()
+        }
+        saveSession()
+        guard initialized else { return }
+        while feed.loading {
+            do { try await Task.sleep(for: .milliseconds(100)) } catch { return }
+        }
+        guard !Task.isCancelled else { return }
+        if feed.items.isEmpty { await feed.loadMore(bridge) }
+        guard !Task.isCancelled else { return }
+        if currentID == nil { currentID = feed.items.first?.id; scrollID = currentID }
+        focusCurrent()
+        saveSession()
+    }
+
+    private func focusCurrent() {
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["DOUDUO_HASHTAG_FIXTURE"] == "1" { return }
+        #endif
+        guard !refreshing, let i = currentIndex else { return }
+        preloader.update(feed.items, current: i)
+        // 不再预解首帧：界面已不用首帧图顶替（老板要纯黑直出），省 CPU 和解码
+        let curID = feed.items[i].id
+        let ahead = Array(feed.items.dropFirst(i + 1))
+        let currentItem = feed.items[i]
+        Task {
+            await DYVideoCache.shared.markWatched(curID)
+            await DYVideoCache.shared.focus(current: currentItem, ahead: ahead)
+        }
+        // 后面不足「缓存条数」就继续拉推荐（至少保证 6 条，节流 4 秒一次）
+        let want = max(6, min(DYVideoCache.limit, 60))
+        if feed.items.count - i - 1 < want, Date().timeIntervalSince(lastFeedPull) > 4 {
+            lastFeedPull = Date()
+            Task {
+                await feed.loadMore(bridge)
+                if let j = currentIndex {
+                    preloader.update(feed.items, current: j)
+                    await DYVideoCache.shared.focus(current: feed.items[j], ahead: Array(feed.items.dropFirst(j + 1)))
+                    if feed.items.count - j - 1 < want { focusCurrent() }
+                }
+            }
+        }
+    }
+
     @ViewBuilder
     private var feedArea: some View {
         ZStack(alignment: .top) {
@@ -3303,50 +3561,47 @@ struct DYClassicFeedScreen: DYRecommendFeedHost {
             Text(String(format: "%g", playbackRate)).font(.caption2).opacity(0.01)
                 .accessibilityIdentifier("douyin.rate")
                 .allowsHitTesting(false)
-            DYRefreshProbeAnchor()
             #endif
         }
         .overlay(alignment: .top) {
-            GeometryReader { header in
-                let headerInsets = compactDuoHeader && showComments ? compactHeaderInsets : insets
-                // This is a sibling of the pager, never a child of a video page.
-                ZStack {
-                    HStack {
-                        DYVideoMoreMenu(extras: AnyView(moreExtrasMenu))
-                        Spacer(minLength: 0)
-                        if !innerPortrait { headerSearch }
+            // This is a sibling of the pager, never a child of a video page.
+            ZStack {
+                HStack {
+                    DYVideoMoreMenu(extras: AnyView(moreExtrasMenu))
+                    Spacer(minLength: 0)
+                    Button {
+                        openSearch()
+                    } label: {
+                        Image(systemName: "magnifyingglass")
+                            .font(.title2)
+                            .frame(width: 44, height: 44)
+                            .contentShape(Rectangle())
                     }
-                    if innerPortrait {
-                        // Leave the system controls at the trailing edge and keep the tabs centered.
-                        HStack(spacing: 8) {
-                            Color.clear.frame(width: 44, height: 1).accessibilityHidden(true)
-                            topBar
-                            headerSearch
-                        }
-                    } else {
-                        topBar.offset(x: titleCentersOnScreen ? (headerInsets.trailing - headerInsets.leading) / 2 : 0)
-                    }
+                    .accessibilityLabel("搜索")
+                    .accessibilityIdentifier("douyin.search")
+                    .accessibilityValue(showSearch ? "已打开" : "未打开")
+                    .opacity(showSearch && searchIsSplit ? 0 : 1)
+                    .allowsHitTesting(!(showSearch && searchIsSplit))
+                    .accessibilityHidden(showSearch && searchIsSplit)
                 }
-                .buttonStyle(.plain)
-                .foregroundStyle(.white)
-                .padding(.leading, 8 + (sidePanelOpen && !compactDuoHeader ? 0 : headerInsets.leading))
-                .padding(.trailing, 8 + (sidePanelOpen && !compactDuoHeader ? 0 : max(headerInsets.trailing,
-                    hingeClosed && !showComments ? DYDuoMetrics.trailingOcclusionInset(header,
-                        pane: CGRect(x: 0, y: 0, width: header.size.width, height: 96)) : 0)))
-                // The adjacent pane owns the horizontal status bar in landscape.
-                .padding(.top, anchorsHeaderToWindow ? 8 : headerTopInset)
-                .background {
-                    LinearGradient(colors: [.black.opacity(0.42), .clear], startPoint: .top, endPoint: .bottom)
-                        .ignoresSafeArea(edges: .top).allowsHitTesting(false)
-                }
-                .offset(y: anchorsHeaderToWindow ? -header.frame(in: .global).minY : 0)
-                .accessibilityElement(children: .contain)
-                .accessibilityIdentifier("douyin.feed.header")
-                .opacity(cleanScreen || liveRoomOpen || presentsLandscapeComments ? 0 : 1)
-                .allowsHitTesting(!cleanScreen && !liveRoomOpen && !(compactDuoHeader && showComments))
-                .accessibilityHidden(cleanScreen || liveRoomOpen || presentsLandscapeComments)
+                // Duo 横置（合屏或展开）：视频铺满屏幕，但一侧的竖排状态栏/导航栏让左右安全区不对称；
+                // 标题抵消这份不对称，按整屏居中。竖置和普通 iPhone 仍在安全区内居中。
+                topBar.offset(x: titleCentersOnScreen ? (insets.trailing - insets.leading) / 2 : 0)
             }
-            .ignoresSafeArea(.container, edges: anchorsHeaderToWindow ? .top : [])
+            .buttonStyle(.plain)
+            .foregroundStyle(.white)
+            .padding(.leading, 8 + (sidePanelOpen ? 0 : insets.leading))
+            .padding(.trailing, 8 + (sidePanelOpen ? 0 : insets.trailing))
+            .padding(.top, headerTopInset)
+            .accessibilityElement(children: .contain)
+            .background {
+                LinearGradient(colors: [.black.opacity(0.42), .clear], startPoint: .top, endPoint: .bottom)
+                    .ignoresSafeArea(edges: .top).allowsHitTesting(false)
+            }
+            .accessibilityIdentifier("douyin.feed.header")
+            .opacity(cleanScreen || liveRoomOpen ? 0 : 1)
+            .allowsHitTesting(!cleanScreen && !liveRoomOpen)
+            .accessibilityHidden(cleanScreen || liveRoomOpen)
         }
         // The video and bottom chrome reach the physical screen; add the actual
         // home-indicator inset once, inside each page, rather than twice.
@@ -3356,35 +3611,17 @@ struct DYClassicFeedScreen: DYRecommendFeedHost {
             if t != .live { live.stop() }
         }
         .navigationDestination(item: Binding(get: { supportsSidePanel ? nil : authorTarget }, set: { if !supportsSidePanel { authorTarget = $0 } })) { a in
-            DYAuthorScreen(bridge: bridge, author: a, onWeb: { u in web = DYWebTarget(url: u) },
-                           onWorkPresentationChange: { authorWorkOpen = $0 })
+            DYAuthorScreen(bridge: bridge, author: a, onWeb: { u in web = DYWebTarget(url: u) })
                 .navigationBarBackButtonHidden()
         }
 
-    }
-
-    private var headerSearch: some View {
-        Button {
-            openSearch()
-        } label: {
-            Image(systemName: "magnifyingglass")
-                .font(.title2)
-                .frame(width: 44, height: 44)
-                .contentShape(Rectangle())
-        }
-        .accessibilityLabel("搜索")
-        .accessibilityIdentifier("douyin.search")
-        .accessibilityValue(showSearch ? "已打开" : "未打开")
-        .opacity(showSearch && searchIsSplit ? 0 : 1)
-        .allowsHitTesting(!(showSearch && searchIsSplit))
-        .accessibilityHidden(showSearch && searchIsSplit)
     }
 
     /// 保留原版频道切换；两侧操作及安全区由系统导航栏管理。
     private var topBar: some View {
         HStack(spacing: 14) {
             ForEach(DYClassicChannelDrag.order, id: \.self) { channel in
-                Button { tapChannel(channel) } label: {
+                Button { selectTab(channel) } label: {
                     VStack(spacing: 3) {
                         Text(channel.title).font(.headline.weight(tab == channel ? .bold : .medium))
                             .foregroundStyle(.white.opacity(tab == channel ? 1 : 0.62))
@@ -3395,8 +3632,7 @@ struct DYClassicFeedScreen: DYRecommendFeedHost {
                     .accessibilityIdentifier("douyin.channel.\(channel == .follow ? "follow" : channel == .recommend ? "recommend" : "live")")
                 }
                 .buttonStyle(.plain)
-                .accessibilityValue(channel == .recommend && refreshing ? "正在刷新" : tab == channel ? "已选择" : "")
-                .accessibilityHint(channel == .recommend && tab == .recommend ? "再次点击刷新推荐" : "切换频道")
+                .accessibilityValue(tab == channel ? "已选择" : "")
             }
         }
         .fixedSize(horizontal: true, vertical: false)
@@ -3485,7 +3721,7 @@ struct DYClassicFeedScreen: DYRecommendFeedHost {
                            onLike: { toggleLike(item.id, force: nil) },
                            onCollect: { toggleCollect(item.id) },
                            onDoubleTap: { toggleLike(item.id, force: true) },
-                           onComments: { authorTarget = nil; showComments.toggle() },
+                           onComments: { withAnimation(.snappy) { authorTarget = nil; showComments.toggle() } },
                            onAuthor: { showComments = false; authorTarget = item.author },
                            onSavePosition: { resume[item.id] = $0; saveSession() },
                            preloader: preloader,
@@ -3499,6 +3735,44 @@ struct DYClassicFeedScreen: DYRecommendFeedHost {
                                endChannelDrag(translation: dx, predicted: predicted, width: width, cancelled: cancelled)
                            } : nil)
     }
+
+    /// 点赞：先本地乐观更新，再调抖音网页接口，按服务端返回决定成败
+    /// （不用 cookie 判断登录态：sessionid 是 HttpOnly，document.cookie 读不到，会误判成未登录）
+    private func toggleLike(_ id: String, force: Bool?) { feed.toggleLike(id, force: force, bridge: bridge) }
+
+
+    /// 不感兴趣：立刻从列表拿掉并切到下一条，后台告诉抖音（失败只提示，不把视频塞回来）
+    private func dislike(_ id: String) {
+        guard let i = feed.items.firstIndex(where: { $0.id == id }) else { return }
+        let next = i + 1 < feed.items.count ? feed.items[i + 1].id : (i > 0 ? feed.items[i - 1].id : nil)
+        scrollEndTask?.cancel(); userScrolling = false
+        showComments = false
+        if currentID == id { currentID = next; scrollID = next }
+        feed.items.remove(at: i)
+        resume[id] = nil
+        saveSession()
+        showToast("将减少此类推荐")
+        Task {
+            await DYVideoCache.shared.markWatched(id)
+            do {
+                switch try await bridge.dislike(id) {
+                case .ok: break
+                case .notLoggedIn: showToast("抖音未登录，「不感兴趣」没同步到账号")
+                case .failed(let why): showToast("「不感兴趣」同步失败：\(why)")
+                }
+            } catch {
+                showToast("「不感兴趣」同步失败：\(error.localizedDescription)")
+            }
+        }
+        if next == nil { Task { await feed.loadMore(bridge); currentID = feed.items.first?.id; scrollID = currentID } }
+    }
+
+    /// 收藏 / 取消收藏（同步到抖音账号的「收藏」）
+    private func toggleCollect(_ id: String) { feed.toggleCollect(id, bridge: bridge) }
+
+
+    private func showToast(_ s: String) { feed.showToast(s) }
+
 
     /// 经典顶栏「更多」：铺满宽度 / 静音 / 听书 / 自动连播在表层，其余全在设置页（刷新推荐 / 弹幕 / 界面不在这里重复）。
     @ViewBuilder
@@ -3570,9 +3844,13 @@ struct DYUpstreamVideoPage: View {
     @AppStorage("douyin_muted_v1") private var muted = false
     @AppStorage("douyin_bg_play_v1") private var bgPlay = false
     @State private var heart = false
+    @State private var danmaku: [DYDanmaku] = []
+    @State private var danmakuLoaded = false
     @State private var saving = false
+    @State private var showDanmakuInput = false
+    @State private var danmakuDraft = ""
+    @State private var danmakuSending = false
     @FocusState private var danmakuFocused: Bool
-    @StateObject private var dm = DYDanmakuModel()
     @AppStorage(DYVideoFit.preferenceKey) private var autoFit = true
     @AppStorage("douyin_danmaku_v1") private var danmakuOn = true
     @AppStorage("douyin_playback_rate_v1") private var playbackRate = 1.0
@@ -3621,7 +3899,7 @@ struct DYUpstreamVideoPage: View {
                                     },
                                     onSavePosition: onSavePosition, onClose: {}, fillWidth: autoFit,
                                     onFillWidthChange: { autoFit = $0 },
-                                    danmaku: danmakuOn ? dm.items : [],
+                                    danmaku: danmakuOn ? danmaku : [],
                                     altURL: nil,
                                     quality: item.q,
                                     fastURL: item.playFast.flatMap(URL.init(string:)),
@@ -3690,31 +3968,39 @@ struct DYUpstreamVideoPage: View {
             }
         }
         .overlay(alignment: .bottom) {
-            if dm.showInput, rootRailTab == nil || onBack != nil {
-                DYDanmakuBar(model: dm, focused: $danmakuFocused, onSend: sendDanmaku).padding(.bottom, max(insets.bottom, 12) + 6)
+            if showDanmakuInput, rootRailTab == nil || onBack != nil {
+                danmakuBar.padding(.bottom, max(insets.bottom, 12) + 6)
             }
         }
-        .preference(key: DYFeedInputActivePreference.self, value: isCurrent && dm.showInput)
+        .preference(key: DYFeedInputActivePreference.self, value: isCurrent && showDanmakuInput)
         .preference(key: DYFeedComposerPreference.self, value: composerEntry)
         .preference(key: DYFeedRailPreference.self, value: railEntry(fg))
         .animation(.snappy, value: heart)
         .onChange(of: isCurrent) { _, c in
-            if !c { dm.showInput = false }
+            if !c { showDanmakuInput = false }
             if c, onBack == nil { DYBoostRouter.shared.adopt(boost) }
         }
         .onAppear { if isCurrent, onBack == nil { DYBoostRouter.shared.adopt(boost) } }
-        // 弹幕：轮到这条时才拉（一次拉整条视频的）——共用 DYDanmakuModel
-        .task(id: isCurrent) { await dm.load(item, isCurrent: isCurrent, bridge: bridge) }
-    }
-
-    private func sendDanmaku() {
-        Task { if await dm.send(item, bridge: bridge, onToast: onToast) { danmakuFocused = false } }
+        // 弹幕：轮到这条时才拉（一次拉整条视频的）
+        .task(id: isCurrent) {
+            guard isCurrent, !danmakuLoaded, item.images.isEmpty, let b = bridge else { return }
+            danmakuLoaded = true
+            // 接口单次只能拿到约 30 秒的弹幕，长视频按 60 秒窗口边拉边显示
+            for await chunk in b.danmakuStream(item.id, durationMs: Int(item.duration * 1000)) {
+                danmaku = DYDanmaku.merged(danmaku, chunk)
+            }
+            // 中途滑走会取消任务：标记回 false，回来重新把剩下的窗口补齐
+            if Task.isCancelled { danmakuLoaded = false }
+            let sorted = danmaku.map(\.offset).sorted()
+            let gapMax = zip(sorted, sorted.dropFirst()).map { $1 - $0 }.max() ?? 0
+            DYLiveModel.log("DDDM id=\(item.id) n=\(danmaku.count) dur=\(String(format: "%.1f", item.duration))s range=\(sorted.first.map { String(format: "%.1f", $0) } ?? "-")..\(sorted.last.map { String(format: "%.1f", $0) } ?? "-") gapMax=\(String(format: "%.1f", gapMax))s afterHalf=\(sorted.filter { $0 > item.duration / 2 }.count)")
+        }
     }
 
     private var composerEntry: [DYFeedComposerEntry] {
-        guard isCurrent, dm.showInput, onBack == nil, let rootRailTab else { return [] }
+        guard isCurrent, showDanmakuInput, onBack == nil, let rootRailTab else { return [] }
         return [DYFeedComposerEntry(id: item.id, tab: rootRailTab,
-                                   content: AnyView(DYDanmakuBar(model: dm, focused: $danmakuFocused, onSend: sendDanmaku).padding(.bottom, 8)))]
+                                   content: AnyView(danmakuBar.padding(.bottom, 8)))]
     }
 
     private func railEntry(_ fg: Color) -> [DYFeedRailEntry] {
@@ -3722,17 +4008,53 @@ struct DYUpstreamVideoPage: View {
         return [DYFeedRailEntry(id: item.id, tab: rootRailTab, actions: AnyView(actions(fg)))]
     }
 
-    /// 加入稍后再看。抖音确认了才提示成功。
-    private func addWatchLater() {
-        guard let bridge else { return }
+    private var danmakuBar: some View {
+        HStack(spacing: 8) {
+            TextField("", text: $danmakuDraft, prompt: Text("发个弹幕见证当下").foregroundStyle(.white.opacity(0.5)))
+                .foregroundStyle(.white)
+                .focused($danmakuFocused)
+                .submitLabel(.send)
+                .onSubmit { sendDanmaku() }
+                .padding(.horizontal, 14).frame(height: 40)
+                .background(Capsule().fill(.black.opacity(0.6)))
+                .accessibilityIdentifier("douyin.danmaku.input")
+            Button(action: sendDanmaku) {
+                if danmakuSending { ProgressView().tint(.white) }
+                else { Text("发送").font(.subheadline.weight(.semibold)) }
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 14).frame(height: 40)
+            .background(Capsule().fill(theme.accent.color(for: scheme)))
+            .disabled(danmakuDraft.trimmingCharacters(in: .whitespaces).isEmpty || danmakuSending)
+            .accessibilityIdentifier("douyin.danmaku.send")
+            Button { showDanmakuInput = false; danmakuFocused = false } label: {
+                Image(systemName: "xmark").font(.subheadline.weight(.semibold)).foregroundStyle(.white)
+                    .frame(width: 36, height: 40)
+            }
+            .accessibilityIdentifier("douyin.danmaku.close")
+        }
+        .padding(.horizontal, 12)
+    }
+
+    private func sendDanmaku() {
+        let text = danmakuDraft.trimmingCharacters(in: .whitespaces)
+        guard !text.isEmpty, !danmakuSending, let b = bridge else { return }
+        danmakuSending = true
+        let at = DDNowPlaying.id == item.id ? DDNowPlaying.time : 0
         Task {
             do {
-                switch try await bridge.addWatchLater(item.id) {
-                case .ok: onToast?("已加入稍后再看")
-                case .notLoggedIn: onToast?("抖音未登录")
-                case .failed(let why): onToast?("没加进去：" + why)
-                }
-            } catch { onToast?("没加进去：" + error.localizedDescription) }
+                let id = try await b.postDanmaku(item.id, text: text, offset: at)
+                // 自己发的立刻上屏（从当前时间点开始飘）
+                danmaku.append(DYDanmaku(id: id, text: text, offset: at + 0.3))
+                danmaku.sort { $0.offset < $1.offset }
+                danmakuDraft = ""
+                showDanmakuInput = false
+                danmakuFocused = false
+                onToast?("弹幕已发送")
+            } catch {
+                onToast?("弹幕发送失败：\(error.localizedDescription)")
+            }
+            danmakuSending = false
         }
     }
 
@@ -3944,13 +4266,9 @@ struct DYUpstreamVideoPage: View {
                 Toggle(isOn: $autoNext) { Label("自动连播", systemImage: "play.square.stack") }
                     .accessibilityIdentifier("douyin.quick.autonext")
             }
-            if bridge != nil {
-                Button("稍后再看", systemImage: "clock") { addWatchLater() }
-                    .accessibilityIdentifier("douyin.watchlater.add")
-            }
             if item.images.isEmpty, bridge != nil {
                 Button("发弹幕", systemImage: "text.bubble") {
-                    dm.showInput = true
+                    showDanmakuInput = true
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { danmakuFocused = true }
                 }
                 .accessibilityIdentifier("douyin.danmaku.open")
@@ -3979,29 +4297,20 @@ struct DYClassicVideoPage: View {
     @Environment(\.duoSystemBars) private var systemBars
     @Environment(\.toolbarVerticalEdge) private var verticalBarEdge
     @Environment(\.duoInlineVideoNavigation) private var inlineNavigation
-    @Environment(\.dyStacksLandscapeComments) private var stacksLandscapeComments
-    @Environment(\.dyHingeClosed) private var hingeClosed
     @Environment(\.displayScale) private var displayScale
     @Environment(\.duoVisibleVideo) private var visibleVideo
     @Environment(\.horizontalSizeClass) private var hSize
-    @Environment(\.verticalSizeClass) private var vSize
-    private var lowersActionRail: Bool {
-        systemBars && ((stacksLandscapeComments && !hingeClosed)
-            || (!DYDuoMetrics.isDuoHardware && vSize == .regular))
-    }
     private var railWidth: CGFloat { hSize == .compact ? 50 : 54 }
     private var chromeSidePadding: CGFloat { 12 }
-    private var videoWindow: UIWindow? {
-        UIApplication.shared.connectedScenes
+    // Full-bleed ancestors may report zero safe-area insets. Read the app's
+    // foreground key window as a fallback, never a guessed device/rail width.
+    private var systemColumnInset: CGFloat {
+        let windowInset = UIApplication.shared.connectedScenes
             .compactMap { $0 as? UIWindowScene }
             .filter { $0.activationState == .foregroundActive }
             .flatMap(\.windows)
-            .first(where: \.isKeyWindow)
-    }
-
-    // Full-bleed ancestors can report zero insets; use the containing window as a fallback.
-    private var systemColumnInset: CGFloat {
-        max(insets.trailing, videoWindow?.safeAreaInsets.right ?? 0)
+            .first(where: \.isKeyWindow)?.safeAreaInsets.right ?? 0
+        return max(insets.trailing, windowInset)
     }
     private var actionRailTrailingPadding: CGFloat {
         guard !inlineNavigation else { return chromeSidePadding }
@@ -4030,8 +4339,6 @@ struct DYClassicVideoPage: View {
     }
     @Environment(\.appTheme) private var theme
     @Environment(\.colorScheme) private var scheme
-    @Environment(\.dyExpandVideoCaption) private var expandVideoCaption
-    @Environment(\.dyInlineCommentVisible) private var inlineCommentVisible
     let item: DYAweme
     let isCurrent: Bool
     let insets: EdgeInsets
@@ -4066,10 +4373,14 @@ struct DYClassicVideoPage: View {
     @Environment(\.ddScale) private var ui
     @AppStorage("douyin_autoplay_v1") private var autoNext = false
     @State private var heart = false
+    @State private var danmaku: [DYDanmaku] = []
+    @State private var danmakuLoaded = false
     @State private var showShare = false
     @State private var showOptions = false
+    @State private var showDanmakuInput = false
+    @State private var danmakuDraft = ""
+    @State private var danmakuSending = false
     @FocusState private var danmakuFocused: Bool
-    @StateObject private var dm = DYDanmakuModel()
     @AppStorage(DYVideoFit.preferenceKey) private var autoFit = true
     @AppStorage("douyin_danmaku_v1") private var danmakuOn = true
     /// 右侧控制区按住任何位置都加速（对齐抖音）：它们盖在手势层之上或在系统栏里，由这个对象转给播放器。
@@ -4119,12 +4430,12 @@ struct DYClassicVideoPage: View {
                                     },
                                     onSavePosition: onSavePosition, onClose: {}, fillWidth: autoFit,
                                     onFillWidthChange: { autoFit = $0 },
-                                    danmaku: danmakuOn ? dm.items : [],
+                                    danmaku: danmakuOn ? danmaku : [],
                                     altURL: nil,
                                     quality: item.q,
                                     fastURL: item.playFast.flatMap(URL.init(string:)),
                                     posterURL: item.cover.flatMap(URL.init(string:)),
-                                    videoAspect: item.videoAspect,
+                                    videoAspect: item.height > 0 ? item.width / item.height : 0,
                                     headEndSeconds: nil,
                                     continuationURL: nil,
                                     onSwipeLeft: onChannelDrag == nil && !cleanScreen ? { (onNavigateLeft ?? onAuthor)() } : nil,
@@ -4134,7 +4445,6 @@ struct DYClassicVideoPage: View {
                                     onHorizontalDrag: cleanScreen ? nil : onChannelDrag,
                                     onHorizontalDragEnd: cleanScreen ? nil : onChannelDragEnd)
                     .environment(\.duoContentInsets, contentInsets)
-                    .environment(\.dyUsesClassicVideoLayout, true)
             } else {
                 // 图集也要有背景音乐（原来只翻图、没声音）
                 DYImageGallery(images: item.images,
@@ -4159,7 +4469,7 @@ struct DYClassicVideoPage: View {
                     .allowsHitTesting(false)
             }
 
-            if !cleanScreen && !inlineCommentVisible {
+            if !cleanScreen {
                 info(fg)
                     .padding(.horizontal, chromeSidePadding)
                     .padding(contentInsets)
@@ -4167,28 +4477,16 @@ struct DYClassicVideoPage: View {
             }
         }
         .overlay(alignment: .trailing) {
-            if !cleanScreen && !inlineCommentVisible && !inlineNavigation && (!systemBars || verticalBarEdge == nil) {
-                let rail = actionCapsule(fg)
+            if !cleanScreen && !inlineNavigation && (!systemBars || verticalBarEdge == nil) {
+                actionCapsule(fg)
                     .modifier(DYRailReservedNudge())
                     .padding(.trailing, actionRailTrailingPadding)
-                if lowersActionRail {
-                    GeometryReader { viewport in
-                        let viewportBottom = viewport.frame(in: .global).maxY
-                        let windowBottom = videoWindow?.bounds.maxY ?? viewportBottom
-                        // Keep the rail beside the description and clear of the home dock.
-                        let bottomPadding = max(0, viewportBottom - windowBottom + 96)
-                        rail.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
-                            .padding(.bottom, bottomPadding)
-                    }
-                } else {
-                    rail
-                }
             }
         }
         .preference(key: DYActiveVideoActionsKey.self,
                     value: systemBars && isCurrent && !inlineNavigation ? toolbarActions(fg) : nil)
         .overlay(alignment: .bottom) {
-            if dm.showInput { DYDanmakuBar(model: dm, focused: $danmakuFocused, onSend: sendDanmaku).padding(.bottom, max(insets.bottom, 0) + 4) }
+            if showDanmakuInput { danmakuBar.padding(.bottom, max(insets.bottom, 0) + 4) }
         }
         .sensoryFeedback(.impact(weight: .light), trigger: liked) { old, new in !old && new }
         .dyBottomSheet(isPresented: $showShare, kind: .share) {
@@ -4196,15 +4494,15 @@ struct DYClassicVideoPage: View {
         }
         .dyBottomSheet(isPresented: $showOptions, kind: .options) {
             DYVideoOptionsPanel(onDislike: onDislike, onSendDanmaku: bridge == nil ? nil : {
-                dm.showInput = true
+                showDanmakuInput = true
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { danmakuFocused = true }
-            }, onWatchLater: bridge == nil ? nil : { addWatchLater() })
+            })
         }
         .onAppear { if isCurrent { publishVisible() } }
-        .onChange(of: isCurrent) { _, active in if active { publishVisible() } }
         .onReceive(followStates) { states in
             followedOverride = states[item.author.secUid ?? ""] ?? states[item.author.uid ?? ""]
         }
+        .onChange(of: isCurrent) { _, active in if active { publishVisible() } }
         .task(id: item.author.avatar) {
             guard let url = item.author.avatar.flatMap(URL.init(string:)) else { authorImage = nil; return }
             let image = await ImageCache.shared.load(url)
@@ -4212,34 +4510,77 @@ struct DYClassicVideoPage: View {
             authorImage = image.map(circularAvatar)
         }
         .animation(.snappy, value: heart)
-        .onChange(of: isCurrent) { _, c in if !c { dm.showInput = false } }
-        // 弹幕：轮到这条时才拉（一次拉整条视频的）——共用 DYDanmakuModel
-        .task(id: isCurrent) { await dm.load(item, isCurrent: isCurrent, bridge: bridge) }
-    }
-
-    private func sendDanmaku() {
-        Task { if await dm.send(item, bridge: bridge, onToast: onToast) { danmakuFocused = false } }
+        .onChange(of: isCurrent) { _, c in if !c { showDanmakuInput = false } }
+        // 弹幕：轮到这条时才拉（一次拉整条视频的）
+        .task(id: isCurrent) {
+            guard isCurrent, !danmakuLoaded, item.images.isEmpty, let b = bridge else { return }
+            danmakuLoaded = true
+            // 接口单次只能拿到约 30 秒的弹幕，长视频按 60 秒窗口边拉边显示
+            for await chunk in b.danmakuStream(item.id, durationMs: Int(item.duration * 1000)) {
+                danmaku = DYDanmaku.merged(danmaku, chunk)
+            }
+            // 中途滑走会取消任务：标记回 false，回来重新把剩下的窗口补齐
+            if Task.isCancelled { danmakuLoaded = false }
+            let sorted = danmaku.map(\.offset).sorted()
+            let gapMax = zip(sorted, sorted.dropFirst()).map { $1 - $0 }.max() ?? 0
+            DYLiveModel.log("DDDM id=\(item.id) n=\(danmaku.count) dur=\(String(format: "%.1f", item.duration))s range=\(sorted.first.map { String(format: "%.1f", $0) } ?? "-")..\(sorted.last.map { String(format: "%.1f", $0) } ?? "-") gapMax=\(String(format: "%.1f", gapMax))s afterHalf=\(sorted.filter { $0 > item.duration / 2 }.count)")
+        }
     }
 
     /// 只有关注流需要把「当前可见视频」报给根视图（评论/标签用）；推荐流根视图自己有 currentID。
     /// 同一条不重复写，避免翻页时根视图多重算一轮。
-    /// 加入稍后再看。抖音确认了才提示成功。
-    private func addWatchLater() {
-        guard let bridge else { return }
-        Task {
-            do {
-                switch try await bridge.addWatchLater(item.id) {
-                case .ok: onToast?("已加入稍后再看")
-                case .notLoggedIn: onToast?("抖音未登录")
-                case .failed(let why): onToast?("没加进去：" + why)
-                }
-            } catch { onToast?("没加进去：" + error.localizedDescription) }
-        }
-    }
-
     private func publishVisible() {
         guard visibleVideo.wrappedValue?.id != item.id else { return }
         visibleVideo.wrappedValue = item
+    }
+
+    private var danmakuBar: some View {
+        HStack(spacing: 8) {
+            TextField("", text: $danmakuDraft, prompt: Text("发个弹幕见证当下").foregroundStyle(.white.opacity(0.5)))
+                .foregroundStyle(.white)
+                .focused($danmakuFocused)
+                .submitLabel(.send)
+                .onSubmit { sendDanmaku() }
+                .padding(.horizontal, 14).frame(height: 40)
+                .background(Capsule().fill(.black.opacity(0.6)))
+                .accessibilityIdentifier("douyin.danmaku.input")
+            Button(action: sendDanmaku) {
+                if danmakuSending { ProgressView().tint(.white) }
+                else { Text("发送").font(.subheadline.weight(.semibold)) }
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 14).frame(height: 40)
+            .background(Capsule().fill(theme.accent.color(for: scheme)))
+            .disabled(danmakuDraft.trimmingCharacters(in: .whitespaces).isEmpty || danmakuSending)
+            .accessibilityIdentifier("douyin.danmaku.send")
+            Button { showDanmakuInput = false; danmakuFocused = false } label: {
+                Image(systemName: "xmark").font(.subheadline.weight(.semibold)).foregroundStyle(.white)
+                    .frame(width: 36, height: 40)
+            }
+        }
+        .padding(.horizontal, 12)
+    }
+
+    private func sendDanmaku() {
+        let text = danmakuDraft.trimmingCharacters(in: .whitespaces)
+        guard !text.isEmpty, !danmakuSending, let b = bridge else { return }
+        danmakuSending = true
+        let at = DDNowPlaying.id == item.id ? DDNowPlaying.time : 0
+        Task {
+            do {
+                let id = try await b.postDanmaku(item.id, text: text, offset: at)
+                // 自己发的立刻上屏（从当前时间点开始飘）
+                danmaku.append(DYDanmaku(id: id, text: text, offset: at + 0.3))
+                danmaku.sort { $0.offset < $1.offset }
+                danmakuDraft = ""
+                showDanmakuInput = false
+                danmakuFocused = false
+                onToast?("弹幕已发送")
+            } catch {
+                onToast?("弹幕发送失败：\(error.localizedDescription)")
+            }
+            danmakuSending = false
+        }
     }
 
     /// 作者、文案、元数据、音乐；音乐贴近进度条，作者头像归入互动栏。
@@ -4252,9 +4593,8 @@ struct DYClassicVideoPage: View {
             .buttonStyle(.plain)
             .accessibilityIdentifier("douyin.author")
             if !item.desc.isEmpty {
-                DYClassicExpandableTitle(text: item.desc, foreground: fg.opacity(0.9),
-                                  secondary: fg.opacity(0.7), hashtagNames: item.hashtagNames ?? [],
-                                  onExpand: expandVideoCaption.map { open in { open(item) } })
+                DYExpandableTitle(text: item.desc, foreground: fg.opacity(0.9),
+                                  secondary: fg.opacity(0.7), hashtagNames: item.hashtagNames ?? [])
             }
             if let metadata = item.metadataText() {
                 Text(metadata).font(.caption2.weight(.regular))
@@ -4300,7 +4640,18 @@ struct DYClassicVideoPage: View {
         followBusy = true
         defer { followBusy = false }
         do {
-            if let failure = try await bridge.followVideoAuthor(item.author) { onToast?(failure) }
+            var uid = item.author.uid
+            if uid?.isEmpty != false, let sec = item.author.secUid {
+                let state = try await bridge.followState(sec: sec)
+                if state.followed { bridge.rememberFollow(item.author, followed: true); return }
+                uid = state.uid
+            }
+            guard let uid, !uid.isEmpty else { onToast?("暂时无法获取作者信息"); return }
+            switch try await bridge.followUser(uid, follow: true) {
+            case .ok: bridge.rememberFollow(item.author, followed: true)
+            case .notLoggedIn: onToast?("抖音未登录，请先登录")
+            case .failed(let message): onToast?("关注失败：" + message)
+            }
         } catch { onToast?("关注失败：" + error.localizedDescription) }
     }
 
@@ -4383,6 +4734,7 @@ struct DYClassicVideoPage: View {
         .accessibilityIdentifier(id)
     }
 
+
 }
 
 enum DYFormat {
@@ -4412,7 +4764,6 @@ struct DYCommentPanel: View {
     @Environment(\.appTheme) private var theme
     @Environment(\.colorScheme) private var scheme
     @Environment(\.horizontalSizeClass) private var hSize
-    @Environment(\.dyCommentTrailingCleared) private var trailingCleared
     @AppStorage(DDChromeMode.key) private var chromeModeRaw = DDChromeMode.classic.rawValue
     private var usesClassicComments: Bool {
         if #available(iOS 27.1, *) { return chromeModeRaw == DDChromeMode.duoClassic.rawValue }
@@ -4425,7 +4776,6 @@ struct DYCommentPanel: View {
     let focus: DYCommentFocus?
     let fillsPane: Bool
     let trailingInset: CGFloat
-    let horizontalStatus: Bool
     @State private var items: [DYComment] = []
     @State private var cursor = 0
     @State private var hasMore = true
@@ -4451,16 +4801,6 @@ struct DYCommentPanel: View {
     @State private var atError: String?
     @State private var sending = false
     @State private var sendErr: String?
-    /// 我自己的 sec_uid，用来认出哪些评论能删
-    @State private var mySec: String?
-    @State private var deletingComment: DYComment?
-    @State private var deletingParent: String?
-    @State private var deleteBusy = false
-    /// 评论配图：相册里选中的那一项 → 处理好等着发的图 → 已经传上去的结果（发评论失败再点发送时不重传）
-    @State private var pickedPhoto: PhotosPickerItem?
-    @State private var imageDraft: DYCommentImageDraft?
-    @State private var imageUploaded: DYImageXUploadResult?
-    @State private var imageLoading = false
     @State private var digged: Set<String> = []
     @State private var diggShown: [String: Int] = [:]
     @State private var relatedWords: [String] = []
@@ -4479,109 +4819,13 @@ struct DYCommentPanel: View {
     @FocusState private var inputFocused: Bool
     /// 设置里的开关：点评论/名字回复时是否自动弹出键盘（关掉后只进入「回复 @某人」状态，点输入框才弹）
     @AppStorage(DYCommentKeyboard.autoFocusKey) private var replyAutoKeyboard = true
+    @Environment(\.dyCommentTrailingCleared) private var trailingCleared
 
-    init(bridge: DouyinBridge, aweme: DYAweme, onClose: (() -> Void)?, focus: DYCommentFocus? = nil,
-         fillsPane: Bool = false, trailingInset: CGFloat = 0, horizontalStatus: Bool = false) {
+    init(bridge: DouyinBridge, aweme: DYAweme, onClose: (() -> Void)?, focus: DYCommentFocus? = nil, fillsPane: Bool = false, trailingInset: CGFloat = 0) {
         self.bridge = bridge; self.aweme = aweme; self.onClose = onClose
         self.fillsPane = fillsPane
         self.trailingInset = trailingInset
-        self.horizontalStatus = horizontalStatus
         self.focus = focus?.awemeID == aweme.id ? focus : nil
-    }
-
-    @Environment(\.dyExpandedCaptionID) private var expandedCaptionID
-    private var showsCaption: Bool { usesClassicComments && expandedCaptionID == aweme.id }
-
-    private var headerTrailingInset: CGFloat {
-        horizontalStatus ? max(trailingInset, 184) : trailingInset
-    }
-
-    private var captionHeader: some View {
-        VStack(spacing: 0) {
-            DYVideoCaptionHeader(bridge: bridge, aweme: aweme, onClose: onClose,
-                                 authorTrailingInset: max(0, headerTrailingInset - trailingInset),
-                                 closeAtLeading: horizontalStatus,
-                                 stacksAuthorInfo: horizontalStatus)
-                .padding(.trailing, trailingInset)
-            Divider()
-        }
-    }
-
-    private var commentTitle: some View {
-        Text(total > 0 ? "\(DYFormat.count(total)) 条评论" : "评论")
-            .font(.subheadline.weight(.semibold))
-            .lineLimit(1)
-            .fixedSize(horizontal: true, vertical: false)
-            .accessibilityIdentifier("douyin.comments.title")
-    }
-
-    @ViewBuilder
-    private var closeButton: some View {
-        if !showsCaption, let onClose {
-            Button(action: onClose) {
-                Image(systemName: "xmark").font(.subheadline.weight(.semibold))
-                    .frame(width: 44, height: 44)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("关闭评论")
-            .accessibilityIdentifier("douyin.comments.close")
-        }
-    }
-
-    private var relatedSearch: some View {
-        ScrollView(.horizontal) {
-            HStack(spacing: 12) {
-                Text("相关搜索").font(.caption).foregroundStyle(.themeTextSecondary)
-                ForEach(relatedWords, id: \.self) { word in
-                    Button { searchRelated(word) } label: {
-                        Label(word, systemImage: "magnifyingglass")
-                            .font(.footnote).lineLimit(1)
-                            .foregroundStyle(theme.accent.color(for: scheme))
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-        }
-        .fixedSize(horizontal: false, vertical: true)
-        .scrollIndicators(.hidden)
-        .clipped()
-        .accessibilityIdentifier("douyin.comments.relatedSearch")
-    }
-
-    private var commentHeading: some View {
-        VStack(spacing: 0) {
-            Group {
-                if horizontalStatus && !showsCaption {
-                    HStack(spacing: 4) {
-                        closeButton
-                        commentTitle
-                        Spacer(minLength: 0)
-                    }
-                    .frame(minHeight: max(44, DYDuoMetrics.windowSafeTop))
-                } else {
-                    ZStack(alignment: .trailing) {
-                        commentTitle.frame(maxWidth: .infinity)
-                        closeButton
-                    }
-                    .frame(minHeight: showsCaption ? 30 : 44)
-                }
-            }
-            .padding(.horizontal, 16)
-            .padding(.trailing, showsCaption ? trailingInset : headerTrailingInset)
-            if !relatedWords.isEmpty {
-                relatedSearch
-                    .padding(.horizontal, 16)
-                    .padding(.trailing, trailingInset)
-                    .padding(.bottom, showsCaption ? 0 : 4)
-            }
-            if !showsCaption { Divider() }
-        }
-        .foregroundStyle(.themeTextPrimary)
-        .contentShape(Rectangle())
-        .modifier(DYPanelDismissGesture(allowsSwipeRight: true, onClose: onClose))
-        .accessibilityElement(children: .contain)
-        .accessibilityIdentifier("douyin.comments.header")
     }
 
     var body: some View {
@@ -4638,7 +4882,7 @@ struct DYCommentPanel: View {
             }
             .accessibilityIdentifier("douyin.comments.list")
             .modifier(DYCommentTopTracker(ids: items.map(\.id), top: $topVisibleID, paused: restoringScroll))
-            .onChange(of: pendingRestoreID) { _, id in restoreUpstreamCommentPosition(proxy, to: id) }
+            .onChange(of: pendingRestoreID) { _, id in restoreCommentPosition(proxy, to: id) }
             .scrollDismissesKeyboard(.interactively)
             .simultaneousGesture(TapGesture().onEnded { if inputFocused, !replyAutoKeyboard { inputFocused = false } })
             .onChange(of: highlight) { _, h in
@@ -4683,90 +4927,94 @@ struct DYCommentPanel: View {
     }
 
     private var classicBody: some View {
-        panelContent
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(fillsPane ? Color(uiColor: .secondarySystemBackground) : .clear)
-            .clipped()
-            .accessibilityElement(children: .contain)
-            .accessibilityIdentifier("douyin.comments.panel")
-            .onGeometryChange(for: CGFloat.self) { geo in
-                DYDuoMetrics.bottomSafeAreaOverlap(in: geo)
-            } action: { bottomSafeArea = $0 }
-            .task(id: aweme.id) { relatedWords = await bridge.relatedSearch(for: aweme) }
-            .fullScreenCover(item: $relatedQuery) { query in
-                DYRelatedSearchScreen(bridge: bridge, word: query.word)
-            }
-            .onDisappear { saveCommentPosition() }
-    }
-
-    private var panelContent: some View {
         VStack(spacing: 0) {
-            if !showsCaption { commentHeading }
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 0) {
-                        if showsCaption {
-                            VStack(spacing: 0) {
-                                captionHeader
-                                commentHeading
-                            }
-                            .fixedSize(horizontal: false, vertical: true)
-                            .padding(.bottom, 8)
+            ZStack {
+                Text(total > 0 ? "\(DYFormat.count(total)) 条评论" : "评论")
+                    .font(.subheadline.weight(.semibold))
+                    .accessibilityIdentifier("douyin.comments.title")
+                if let onClose {
+                    HStack {
+                        Spacer()
+                        Button(action: onClose) {
+                            Image(systemName: "xmark").font(.subheadline.weight(.semibold))
+                                .frame(width: 44, height: 44).contentShape(Rectangle())
                         }
-                        Group {
-                            if focusMiss {
-                                Text("这条评论已删除或暂不可见").font(.footnote).foregroundStyle(.themeTextSecondary)
-                                    .frame(maxWidth: .infinity)
-                            }
-                            ForEach(items) { c in
-                                VStack(alignment: .leading, spacing: 10) {
-                                    row(c, parent: nil)
-                                    if c.replies > 0 || !(replies[c.id] ?? []).isEmpty { replyBlock(c) }
-                                }
-                                .id(c.id)
-                            }
-                            if let error {
-                                Text(error).font(.caption).foregroundStyle(.themeTextSecondary)
-                                    .frame(maxWidth: .infinity)
-                            }
-                            if hasMore {
-                                ProgressView().frame(maxWidth: .infinity)
-                                    .onAppear { Task { await load() } }
-                            } else if items.isEmpty {
-                                Text("还没有评论").font(.footnote).foregroundStyle(.themeTextSecondary)
-                                    .frame(maxWidth: .infinity)
-                            }
-                        }
-                        .padding(.horizontal, 16)
-                        .padding(.trailing, trailingInset)
-                        .padding(.bottom, 16)
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("关闭评论")
+                        .accessibilityIdentifier("douyin.comments.close")
                     }
-                    .scrollTargetLayout()
-                    .padding(.top, showsCaption ? 0 : 16)
-                }
-                .clipped()
-                .modifier(DYScrollTopObserver(atTop: $listAtTop))
-                .modifier(DYPanelDismissGesture(isAtTop: listAtTop, allowsSwipeRight: true, onClose: onClose))
-                .accessibilityIdentifier("douyin.comments.list")
-                .modifier(DYCommentTopTracker(ids: items.map(\.id), top: $topVisibleID, paused: restoringScroll))
-                .task(id: pendingRestoreID) {
-                    guard !showsCaption, let id = pendingRestoreID else { return }
-                    await restoreCommentPosition(proxy, to: id)
-                }
-                .scrollDismissesKeyboard(.interactively)
-                .simultaneousGesture(TapGesture().onEnded { if inputFocused, !replyAutoKeyboard { inputFocused = false } })
-                .onChange(of: highlight) { _, h in
-                    guard !showsCaption, let h else { return }
-                    withAnimation(.snappy) { proxy.scrollTo(h, anchor: .center) }
                 }
             }
-            .id(showsCaption)
-            .transition(.identity)
-            .onChange(of: showsCaption) { _, expanded in
-                guard expanded else { return }
-                restoringScroll = false
-                pendingRestoreID = nil
-                listAtTop = true
+            .frame(minHeight: 44)
+            .foregroundStyle(.themeTextPrimary)
+            .padding(.horizontal, 16)
+            .padding(.trailing, trailingInset)
+            .contentShape(Rectangle())
+            .modifier(DYPanelDismissGesture(allowsSwipeRight: true, onClose: onClose))
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("douyin.comments.header")
+
+            if !relatedWords.isEmpty {
+                ScrollView(.horizontal) {
+                    HStack(spacing: 12) {
+                        Text("相关搜索").font(.caption).foregroundStyle(.themeTextSecondary)
+                        ForEach(relatedWords, id: \.self) { word in
+                            Button { searchRelated(word) } label: {
+                                Label(word, systemImage: "magnifyingglass")
+                                    .font(.footnote).lineLimit(1)
+                                    .foregroundStyle(theme.accent.color(for: scheme))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, 16).padding(.top, 0).padding(.bottom, 4)
+                }
+                .scrollIndicators(.hidden)
+                .frame(maxWidth: .infinity)
+                .clipped()
+                .padding(.trailing, trailingInset)
+                .accessibilityIdentifier("douyin.comments.relatedSearch")
+            }
+            Divider()
+            ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 16) {
+                    if focusMiss {
+                        Text("这条评论已删除或暂不可见").font(.caption).foregroundStyle(.themeTextSecondary)
+                            .frame(maxWidth: .infinity)
+                    }
+                    ForEach(items) { c in
+                        VStack(alignment: .leading, spacing: 10) {
+                            row(c, parent: nil)
+                            if c.replies > 0 || !(replies[c.id] ?? []).isEmpty { replyBlock(c) }
+                        }
+                        .id(c.id)
+                    }
+                    if let error {
+                        Text(error).font(.caption).foregroundStyle(theme.status.danger.color(for: scheme))
+                    }
+                    if hasMore {
+                        ProgressView().frame(maxWidth: .infinity)
+                            .onAppear { Task { await load() } }
+                    } else if items.isEmpty {
+                        Text("还没有评论").font(.footnote).foregroundStyle(.themeTextSecondary).frame(maxWidth: .infinity)
+                    }
+                }
+                .scrollTargetLayout()   // 评论位置记忆要知道哪条在屏幕最上面
+                .padding(16)
+            }
+            .clipped()
+            .modifier(DYScrollTopObserver(atTop: $listAtTop))
+            .modifier(DYPanelDismissGesture(isAtTop: listAtTop, allowsSwipeRight: true, onClose: onClose))
+            .accessibilityIdentifier("douyin.comments.list")
+            .modifier(DYCommentTopTracker(ids: items.map(\.id), top: $topVisibleID, paused: restoringScroll))
+            .onChange(of: pendingRestoreID) { _, id in restoreCommentPosition(proxy, to: id) }
+            .scrollDismissesKeyboard(.interactively)
+            .simultaneousGesture(TapGesture().onEnded { if inputFocused, !replyAutoKeyboard { inputFocused = false } })
+            .onChange(of: highlight) { _, h in
+                guard let h else { return }
+                withAnimation(.snappy) { proxy.scrollTo(h, anchor: .center) }
+            }
             }
             VStack(spacing: 0) {
                 Divider()
@@ -4775,6 +5023,19 @@ struct DYCommentPanel: View {
             .fixedSize(horizontal: false, vertical: true)
             .background(fillsPane ? Color.ddBackground : .clear)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(fillsPane ? Color.ddBackground : .clear)
+        .clipped()
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("douyin.comments.panel")
+        .onGeometryChange(for: CGFloat.self) { geo in
+            DYDuoMetrics.bottomSafeAreaOverlap(in: geo)
+        } action: { bottomSafeArea = $0 }
+        .task(id: aweme.id) { relatedWords = await bridge.relatedSearch(for: aweme) }
+        .fullScreenCover(item: $relatedQuery) { query in
+            DYRelatedSearchScreen(bridge: bridge, word: query.word)
+        }
+        .onDisappear { saveCommentPosition() }
     }
 
     /// 关掉评论区：把已加载的评论、楼中楼和当前位置存下，同一条视频再打开时原样恢复
@@ -4790,26 +5051,7 @@ struct DYCommentPanel: View {
     /// 打开评论区：数据恢复后滚回上次看到的那条（不带动画）。
     /// LazyVStack 第一次布局还没量出远处行的高度，单次 scrollTo 可能停在半路，
     /// 所以下一帧和稍后各补一次，最后再放开「最上面那条」的跟踪。
-    private func restoreCommentPosition(_ proxy: ScrollViewProxy, to id: String) async {
-        defer {
-            if !Task.isCancelled {
-                restoringScroll = false
-                pendingRestoreID = nil
-            }
-        }
-        guard items.contains(where: { $0.id == id }) else { return }
-        var tx = Transaction()
-        tx.disablesAnimations = true
-        await Task.yield()
-        for interval in [80, 120, 0] {
-            guard !Task.isCancelled else { return }
-            withTransaction(tx) { proxy.scrollTo(id, anchor: .top) }
-            if interval > 0 { try? await Task.sleep(for: .milliseconds(interval)) }
-        }
-        DYLiveModel.log("DDCOMMENTMEM scrolled aweme=\(aweme.id.suffix(6)) to=\(id.suffix(6)) top_now=\(topVisibleID?.suffix(6) ?? "-")")
-    }
-
-    private func restoreUpstreamCommentPosition(_ proxy: ScrollViewProxy, to id: String?) {
+    private func restoreCommentPosition(_ proxy: ScrollViewProxy, to id: String?) {
         guard let id, items.contains(where: { $0.id == id }) else { restoringScroll = false; return }
         var tx = Transaction(); tx.disablesAnimations = true
         DispatchQueue.main.async {
@@ -4847,29 +5089,6 @@ struct DYCommentPanel: View {
             if let e = sendErr {
                 Text(e).font(.caption2).foregroundStyle(theme.status.danger.color(for: scheme))
             }
-            if imageLoading {
-                HStack(spacing: 8) {
-                    ProgressView().controlSize(.mini)
-                    Text("处理图片…").font(.caption2).foregroundStyle(.themeTextSecondary)
-                }
-            } else if let img = imageDraft {
-                ZStack(alignment: .topTrailing) {
-                    Image(uiImage: img.preview).resizable().scaledToFill()
-                        .frame(width: 64, height: 64)
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                    Button { clearCommentImage() } label: {
-                        Image(systemName: "xmark.circle.fill").font(.body)
-                            .symbolRenderingMode(.palette).foregroundStyle(.white, .black.opacity(0.6))
-                    }
-                    .buttonStyle(.plain)
-                    .offset(x: 6, y: -6)
-                    .disabled(sending)
-                    .accessibilityLabel("移除图片")
-                    .accessibilityIdentifier("douyin.comment.image.remove")
-                }
-                .padding(.top, 6)
-                .accessibilityIdentifier("douyin.comment.image.preview")
-            }
             HStack(spacing: 8) {
                 Button {
                     showEmoji.toggle()
@@ -4891,18 +5110,6 @@ struct DYCommentPanel: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityIdentifier("douyin.comment.at")
-                PhotosPicker(selection: $pickedPhoto, matching: .images, photoLibrary: .shared()) {
-                    Image(systemName: "photo").font(.body)
-                        .foregroundStyle(imageDraft != nil ? theme.accent.color(for: scheme) : .themeTextSecondary)
-                }
-                .buttonStyle(.plain)
-                .disabled(sending)
-                .accessibilityLabel("添加图片")
-                .accessibilityIdentifier("douyin.comment.image")
-                .onChange(of: pickedPhoto) { _, item in
-                    guard let item else { return }
-                    Task { await loadCommentImage(item) }
-                }
                 TextField(replyTo == nil ? "说点什么…" : "回复 \(replyTo!.name)", text: $draft, axis: .vertical)
                     .lineLimit(1...4)
                     .focused($inputFocused)
@@ -4924,8 +5131,8 @@ struct DYCommentPanel: View {
                     else { Image(systemName: "paperplane.fill").font(.body.weight(.semibold)) }
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(hasCommentContent ? theme.accent.color(for: scheme) : Color.secondary)
-                .disabled(!hasCommentContent || sending || imageLoading)
+                .foregroundStyle(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? Color.secondary : theme.accent.color(for: scheme))
+                .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || sending)
                 .accessibilityIdentifier("douyin.comment.send")
             }
             if showEmoji {
@@ -4960,14 +5167,6 @@ struct DYCommentPanel: View {
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("douyin.comments.composer")
         .task { await DYEmojiStore.shared.load(bridge: bridge) }
-        .task { if mySec == nil { mySec = try? await bridge.selfSecUid() } }
-        .alert("删除这条评论？", isPresented: Binding(get: { deletingComment != nil }, set: { if !$0 { deletingComment = nil } })) {
-            Button("删除", role: .destructive) {
-                if let c = deletingComment { Task { await deleteComment(c, parent: deletingParent) } }
-                deletingComment = nil
-            }
-            Button("取消", role: .cancel) { deletingComment = nil }
-        } message: { Text("删除后找不回来。") }
     }
 
     /// 拉「我关注的人」给 @ 面板用
@@ -5045,52 +5244,16 @@ struct DYCommentPanel: View {
         return Array(out.prefix(30))
     }
 
-    /// 有字或有图就能发（网页同款：带图时正文可以为空）
-    private var hasCommentContent: Bool {
-        !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || imageDraft != nil
-    }
-
-    private func clearCommentImage() {
-        pickedPhoto = nil; imageDraft = nil; imageUploaded = nil
-    }
-
-    private func loadCommentImage(_ item: PhotosPickerItem) async {
-        imageLoading = true
-        defer { imageLoading = false }
-        imageUploaded = nil
-        guard let raw = try? await item.loadTransferable(type: Data.self) else {
-            imageDraft = nil; pickedPhoto = nil
-            sendErr = "没能读取这张图片"
-            return
-        }
-        let prepared = await Task.detached(priority: .userInitiated) { DYCommentImagePrep.prepare(raw) }.value
-        guard pickedPhoto == item else { return }   // 处理期间又换了一张或点了移除
-        if let prepared {
-            imageDraft = prepared; sendErr = nil
-        } else {
-            imageDraft = nil; pickedPhoto = nil
-            sendErr = "这张图片用不了（格式不支持或太大）"
-        }
-    }
-
     private func send() async {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard hasCommentContent, !sending, !imageLoading else { return }
+        guard !text.isEmpty, !sending else { return }
         sending = true
         defer { sending = false }
         do {
-            // 先传图再发评论；图传上去了但评论没发成时留着结果，再点发送不重传
-            var image: DYImageXUploadResult?
-            if let img = imageDraft {
-                if imageUploaded == nil {
-                    imageUploaded = try await bridge.uploadCommentImage(img.data, fileName: img.fileName, measured: img.measured)
-                }
-                image = imageUploaded
-            }
             // 回楼中楼：reply_id 必须是一级评论，被回的那条放 reply_to_reply_id（网页同款）
             let top = replyParent ?? replyTo?.id
             let c = try await bridge.publishComment(aweme.id, text: text, replyID: top,
-                                                    replyToReplyID: replyParent == nil ? nil : replyTo?.id, image: image)
+                                                    replyToReplyID: replyParent == nil ? nil : replyTo?.id)
             if let top {
                 replies[top, default: []].insert(c, at: 0)
             } else {
@@ -5098,7 +5261,6 @@ struct DYCommentPanel: View {
                 total += 1
             }
             draft = ""; replyTo = nil; replyParent = nil; sendErr = nil
-            clearCommentImage()
             inputFocused = false
         } catch {
             sendErr = "发送失败：\(error.localizedDescription)"
@@ -5107,6 +5269,7 @@ struct DYCommentPanel: View {
 
     private func row(_ c: DYComment, parent: String?) -> some View {
         rowBody(c)
+            .padding(.trailing, fillsPane && c.id == items.first?.id ? trailingInset : 0)
             .contentShape(Rectangle())
             .onTapGesture {
                 if inputFocused, replyTo?.id == c.id { inputFocused = false; return }   // 再点同一条 = 收键盘
@@ -5120,48 +5283,6 @@ struct DYCommentPanel: View {
                 }
             }
             .accessibilityIdentifier(highlight == c.id ? "douyin.comment.focused" : "douyin.comment.row")
-            .contextMenu {
-                if canDelete(c) {
-                    Button("删除", systemImage: "trash", role: .destructive) {
-                        deletingParent = parent ?? c.parent
-                        deletingComment = c
-                    }
-                    .accessibilityIdentifier("douyin.comment.delete")
-                }
-            }
-    }
-
-    /// 能删的评论：我自己发的，或者这条作品是我的（作者能删自己作品下的评论）。认不出我是谁时不给删。
-    private func canDelete(_ c: DYComment) -> Bool {
-        guard let me = mySec, !me.isEmpty else { return false }
-        return c.sec == me || aweme.author.secUid == me
-    }
-
-    /// 删除评论。抖音确认了才从列表里拿掉；失败时原样留着并说明原因。
-    private func deleteComment(_ c: DYComment, parent: String?) async {
-        guard !deleteBusy else { return }
-        deleteBusy = true
-        defer { deleteBusy = false }
-        do {
-            switch try await bridge.deleteComment(c.id) {
-            case .ok:
-                if let parent, replies[parent]?.contains(where: { $0.id == c.id }) == true {
-                    replies[parent]?.removeAll { $0.id == c.id }
-                } else {
-                    items.removeAll { $0.id == c.id }
-                    replies[c.id] = nil
-                }
-                if replyTo?.id == c.id { replyTo = nil; replyParent = nil }
-                if total > 0 { total -= 1 }
-                sendErr = nil
-            case .notLoggedIn:
-                sendErr = "抖音未登录"
-            case .failed(let why):
-                sendErr = "没删掉：" + why
-            }
-        } catch {
-            sendErr = "没删掉：" + error.localizedDescription
-        }
     }
 
     private func rowBody(_ c: DYComment) -> some View {
@@ -5315,10 +5436,7 @@ struct DYCommentPanel: View {
             replies = m.replies; replyCursor = m.replyCursor; replyMore = m.replyMore
             digged = m.digged; diggShown = m.diggShown
             topVisibleID = m.topID
-            if !showsCaption, let t = m.topID, t != m.items.first?.id {
-                restoringScroll = true
-                pendingRestoreID = t
-            }
+            if let t = m.topID, t != m.items.first?.id { restoringScroll = true; pendingRestoreID = t }
             DYLiveModel.log("DDCOMMENTMEM restore aweme=\(aweme.id.suffix(6)) n=\(m.items.count) top=\(m.topID?.suffix(6) ?? "-")")
             return
         }
@@ -5490,29 +5608,6 @@ extension DYFeedModel {
 
 @MainActor
 extension DYFeedModel {
-    /// Prepare separately so an empty, failed or cancelled request cannot erase playback.
-    /// Callers hold their refresh guard while waiting for existing prefetch work.
-    func prepareRefresh(_ bridge: DouyinBridge) async throws -> DYFeedModel {
-        while loading { try await Task.sleep(for: .milliseconds(100)) }
-        try Task.checkCancellation()
-        let previous = Set(items.map(\.id))
-        let replacement = DYFeedModel(defaults: defaults)
-        replacement.screenWide = screenWide
-        await replacement.loadMore(bridge)
-        try Task.checkCancellation()
-        replacement.items.removeAll { previous.contains($0.id) }
-        return replacement
-    }
-
-    func replaceRecommendations(with replacement: DYFeedModel) {
-        guard !replacement.items.isEmpty else { return }
-        reset()
-        items = replacement.items
-        pool = replacement.pool
-        liked.formUnion(replacement.liked)
-        collected.formUnion(replacement.collected)
-    }
-
     func toggleLike(_ id: String, force: Bool?, bridge: DouyinBridge) {
         let has = self.liked.contains(id)
         let want = force ?? !has
@@ -5576,20 +5671,6 @@ extension DYFeedModel {
             }
         }
     }
-    /// 两套根视图的 saveSession 都会调：记下当前条与各条进度，供切换界面模式后的另一套根视图接手。
-    func noteCurrent(_ id: String, positions: [String: Double]) {
-        handoffCurrentID = id
-        handoffPositions = positions
-    }
-
-    /// 新根视图初始化时取：当前条还在列表里才算数；正在播的那条用播放器的实时进度（比 5 秒一次的存档新）。
-    func handoff() -> (currentID: String, positions: [String: Double])? {
-        guard let id = handoffCurrentID, items.contains(where: { $0.id == id }) else { return nil }
-        var positions = handoffPositions
-        if DDNowPlaying.id == id, DDNowPlaying.time.isFinite { positions[id] = max(0, DDNowPlaying.time) }
-        return (id, positions)
-    }
-
     /// 启动秒开：先恢复上次会话；没有会话就从本地已缓存未看的视频按竖横比例挑 6 条。
     /// 返回要定位的当前条和各条进度；都没有返回 nil。
     func restoreForLaunch() -> (currentID: String?, positions: [String: Double])? {
@@ -5646,6 +5727,7 @@ private struct DYFitCornerGlyph: Shape {
         return p
     }
 }
+
 
 /// 评论区位置记忆（内存里，按视频 id，最多记 20 条视频）。
 /// 关掉评论区再打开：不重新加载，评论、展开的楼中楼、点赞状态原样恢复，并滚回上次看到的那条。

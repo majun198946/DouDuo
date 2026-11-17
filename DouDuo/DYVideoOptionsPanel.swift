@@ -13,10 +13,8 @@ struct DYVideoOptionsPanel: View {
     @AppStorage("douyin_bg_play_v1") private var backgroundPlay = false
     @AppStorage("douyin_autoplay_v1") private var autoNext = false
     @State private var listAtTop = true
-    @State private var headerHeight: CGFloat = 44
     var onDislike: (() -> Void)?
     var onSendDanmaku: (() -> Void)?
-    var onWatchLater: (() -> Void)?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -30,7 +28,6 @@ struct DYVideoOptionsPanel: View {
                 }
             }
             .padding(.horizontal, 12)
-            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { headerHeight = $0 }
             .contentShape(Rectangle())
             .modifier(DYPanelDismissGesture(onClose: { dismiss() }))
             ScrollView {
@@ -89,27 +86,16 @@ struct DYVideoOptionsPanel: View {
                             .frame(maxWidth: .infinity, minHeight: 52, alignment: .leading)
                             .accessibilityIdentifier("douyin.danmaku.open")
                         }
-                        if let onWatchLater {
-                            Divider().padding(.leading, 16)
-                            Button("稍后再看", systemImage: "clock") {
-                                dismiss()
-                                onWatchLater()
-                            }
-                            .padding(.horizontal, 16)
-                            .frame(maxWidth: .infinity, minHeight: 52, alignment: .leading)
-                            .accessibilityIdentifier("douyin.watchlater.add")
-                        }
                     }
                     .optionGroup()
+
+                    Text("自动连播、环境光、推荐筛选、弹幕、界面等在「更多 → 设置」里")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 4)
                 }
                 .padding(.horizontal, 16).padding(.top, 4)
                 .padding(.bottom, max(16, DYDuoMetrics.windowBottomInset + 4))
-                .background {
-                    GeometryReader { geometry in
-                        Color.clear.preference(key: DYBottomPanelContentHeightKey.self,
-                                               value: headerHeight + geometry.size.height)
-                    }
-                }
             }
             .scrollBounceBehavior(.basedOnSize)
             .onScrollGeometryChange(for: Bool.self) { $0.contentOffset.y + $0.contentInsets.top <= 1 } action: { _, atTop in listAtTop = atTop }

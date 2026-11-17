@@ -72,8 +72,6 @@ private struct DYFollowRead: Decodable {
     let follow: Int
     let uid: String?
     let msg: String?
-    /// 我是否已拉黑对方（profile/other 的 user.is_block）。缺字段当没拉黑。
-    var blocked: Bool? = nil
 }
 
 private struct DYFollowWrite: Decodable {
@@ -128,35 +126,12 @@ extension DouyinBridge {
     }
 
     /// 只读关注状态，给按钮初值。不发关注。
-    func followState(sec: String) async throws -> (followed: Bool, uid: String?, blocked: Bool) {
+    func followState(sec: String) async throws -> (followed: Bool, uid: String?) {
         let d = try await call(Self.followReadJS, args: ["sec": sec], attempts: 1)
         let p = try JSONDecoder().decode(DYFollowRead.self, from: d)
         if p.code == 8 { throw DYError.bad("抖音未登录") }
         guard p.status == 200 else { throw DYError.blocked(p.msg ?? "HTTP \(p.status)") }
-        return (p.follow > 0, p.uid, p.blocked ?? false)
-    }
-
-    /// Resolve a video author and publish the same follow state to every surface.
-    func followVideoAuthor(_ author: DYAweme.Author) async throws -> String? {
-        var uid = author.uid
-        if uid?.isEmpty != false, let sec = author.secUid {
-            let state = try await followState(sec: sec)
-            if state.followed {
-                rememberFollow(author, followed: true)
-                return nil
-            }
-            uid = state.uid
-        }
-        guard let uid, !uid.isEmpty else { return "暂时无法获取作者信息" }
-        switch try await followUser(uid, follow: true) {
-        case .ok:
-            rememberFollow(author, followed: true)
-            return nil
-        case .notLoggedIn:
-            return "抖音未登录，请先登录"
-        case .failed(let message):
-            return "关注失败：" + message
-        }
+        return (p.follow > 0, p.uid)
     }
 
     /// 关注 / 取消关注。只在按钮点击时调用，测试不要打这条。
@@ -296,7 +271,7 @@ extension DouyinBridge {
     const r = await req('GET', '/aweme/v1/web/user/profile/other/?' + q({ sec_user_id: sec, publish_video_strategy_type: '2', personal_center_strategy: '1' }));
     const d = parse(r.t) || {};
     const u = d.user || {};
-    return JSON.stringify({ status: r.s, code: d.status_code ?? null, follow: u.follow_status || 0, uid: u.uid ? String(u.uid) : null, blocked: !!u.is_block, msg: d.status_msg || null });
+    return JSON.stringify({ status: r.s, code: d.status_code ?? null, follow: u.follow_status || 0, uid: u.uid ? String(u.uid) : null, msg: d.status_msg || null });
     """#
 
     private static let followWriteJS = #"""
