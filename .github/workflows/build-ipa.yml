@@ -1,7 +1,8 @@
 name: Build Unsigned IPA
 
-# 云端编译未签名 IPA：macos-26 runner 自带 Xcode 27（含 iOS 26 SDK），
-# 满足 project.yml 里 iOS 26.0 的部署目标。公开仓库免费。
+# 云端编译未签名 IPA：项目使用了 iOS 27 / 27.1 才有的新 SwiftUI API
+# （toolbarVerticalEdge、reservedRegions、@ContentBuilder 等），
+# 必须用 Xcode 27（iOS 27.x SDK）编译。xcode-27 runner 自带 Xcode 27。
 # 产物是未签名 IPA，下载后仍需自行签名（爱思助手 / 全能签）。
 
 on:
@@ -12,7 +13,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-26
+    runs-on: xcode-27
     timeout-minutes: 60
 
     steps:
