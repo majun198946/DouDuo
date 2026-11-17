@@ -1,0 +1,61 @@
+name: Build Unsigned IPA
+
+# 云端编译未签名 IPA：macos-26 runner 自带 Xcode 27（含 iOS 26 SDK），
+# 满足 project.yml 里 iOS 26.0 的部署目标。公开仓库免费。
+# 产物是未签名 IPA，下载后仍需自行签名（爱思助手 / 全能签）。
+
+on:
+  workflow_dispatch:        # 手动在 Actions 页点运行
+  push:
+    tags:
+      - 'v*'               # 打 tag 也自动编
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache VLCKit
+        id: cache-vlc
+        uses: actions/cache@v4
+        with:
+          path: Vendor/VLCKit/VLCKit-all.xcframework
+          key: vlckit-3.6.0-${{ hashFiles('scripts/fetch-vlckit.sh') }}
+
+      - name: Fetch VLCKit
+        if: steps.cache-vlc.outputs.cache-hit != 'true'
+        run: ./scripts/fetch-vlckit.sh
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate project
+        run: xcodegen generate
+
+      - name: Build (unsigned)
+        run: |
+          xcodebuild -project DouDuo.xcodeproj -scheme DouDuo \
+            -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData \
+            build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+
+      - name: Package IPA
+        run: |
+          VER=$(grep -E '^ +MARKETING_VERSION:' project.yml | head -1 | awk '{print $2}')
+          rm -rf build/ipa && mkdir -p build/ipa/Payload
+          cp -R build/DerivedData/Build/Products/Release-iphoneos/DouDuo.app build/ipa/Payload/
+          (cd build/ipa && zip -qry ../DouDuo-$VER-unsigned.ipa Payload)
+          echo "VERSION=$VER" >> "$GITHUB_ENV"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DouDuo-${{ env.VERSION }}-unsigned
+          path: build/DouDuo-${{ env.VERSION }}-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 90
