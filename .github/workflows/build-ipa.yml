@@ -31,6 +31,25 @@ jobs:
         if: steps.cache-vlc.outputs.cache-hit != 'true'
         run: ./scripts/fetch-vlckit.sh
 
+      - name: List & select Xcode 27.2
+        run: |
+          echo "=== 所有已安装 Xcode ==="
+          ls -d /Applications/Xcode*.app 2>/dev/null
+          echo "=== 默认 xcodebuild 版本 ==="
+          xcodebuild -version 2>&1 | head -2
+          echo "=== 尝试切到 Xcode 27.2 ==="
+          if [ -d "/Applications/Xcode_27.2.app" ]; then
+            sudo xcode-select -s /Applications/Xcode_27.2.app
+            echo "已切换到 Xcode 27.2"
+          elif command -v xcodes >/dev/null 2>&1; then
+            echo "xcodes 可用，尝试列出可装版本"
+            xcodes list 2>&1 | head -20 || echo "xcodes list 失败"
+          else
+            echo "无 Xcode 27.2，也无 xcodes"
+          fi
+          echo "=== 切换后 xcodebuild 版本 ==="
+          xcodebuild -version 2>&1 | head -2
+
       - name: Install xcodegen
         run: brew install xcodegen
 
