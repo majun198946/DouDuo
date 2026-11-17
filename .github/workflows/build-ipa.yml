@@ -64,18 +64,19 @@ jobs:
             -derivedDataPath build/DerivedData \
             build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
 
-      - name: Package IPA
+      - name: Package IPA (lipo 瘦身 + 去签名)
         run: |
-          VER=$(grep -E '^ +MARKETING_VERSION:' project.yml | head -1 | awk '{print $2}')
-          rm -rf build/ipa && mkdir -p build/ipa/Payload
-          cp -R build/DerivedData/Build/Products/Release-iphoneos/DouDuo.app build/ipa/Payload/
-          (cd build/ipa && zip -qry ../DouDuo-$VER-unsigned.ipa Payload)
-          echo "VERSION=$VER" >> "$GITHUB_ENV"
+          APP=$(find build/DerivedData/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
+          echo "APP=$APP"
+          python3 scripts/package_unsigned.py "$APP" build/
+          echo "VERSION=$(grep -E '^ +MARKETING_VERSION:' project.yml | head -1 | awk '{print $2}')" >> "$GITHUB_ENV"
+          # 把 package_unsigned.py 产出的文件名规范成 upload 步骤能识别的
+          ls -la build/*.ipa
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
           name: DouDuo-${{ env.VERSION }}-unsigned
-          path: build/DouDuo-${{ env.VERSION }}-unsigned.ipa
+          path: build/*.ipa
           if-no-files-found: error
           retention-days: 90
