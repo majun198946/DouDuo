@@ -23,11 +23,18 @@ struct DYFeedSession: Codable {
         return session
     }
     func save() {
-        guard items.contains(where: { $0.id == currentID }),
-              let data = try? JSONEncoder().encode(self) else { return }
-        do { try data.write(to: Self.url, options: .atomic) }
-        catch { DYLiveModel.log("DDSESSION 保存失败 \(error.localizedDescription)") }
+        guard items.contains(where: { $0.id == currentID }) else { return }
+        // 编码 + 原子写盘挪到后台队列：feed.items 可能几十上百条，主线程同步 encode+write 会卡滑动。
+        // DYFeedSession 是 Codable 值类型，此刻已完成值拷贝，后台 encode 安全。
+        let copy = self
+        Self.saveQueue.async {
+            guard let data = try? JSONEncoder().encode(copy) else { return }
+            do { try data.write(to: Self.url, options: .atomic) }
+            catch { DYLiveModel.log("DDSESSION 保存失败 \(error.localizedDescription)") }
+        }
     }
+    /// 后台保存队列（串行，避免并发写同一文件）
+    private static let saveQueue = DispatchQueue(label: "dy.feed-session.save", qos: .utility)
 }
 
 actor DYVideoCache {

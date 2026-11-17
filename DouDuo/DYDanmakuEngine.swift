@@ -59,6 +59,8 @@ final class DYDanmakuEngineView: UIView {
     private var pool: [CALayer] = []
     private var images: [String: CGImage] = [:]
     private var sizes: [String: CGSize] = [:]
+    /// 后台预渲染队列：把「文字光栅化」从主线程挪走，弹幕刷屏时不再卡主线程
+    private static let renderQueue = DispatchQueue(label: "dy.danmaku.render", qos: .userInitiated)
     private var lastShown: [String: Double] = [:]   // 去重：同文本 10s 内不重复
     private var link: CADisplayLink?
     private var clock = DYDanmakuClock()
@@ -104,8 +106,17 @@ final class DYDanmakuEngineView: UIView {
         let fresh = items.filter { $0.offset.isFinite && $0.offset >= 0 && !$0.id.isEmpty && !queued.contains($0.id) }
         guard !fresh.isEmpty else { return }
         for d in fresh { queued.insert(d.id) }
+        // 新弹幕丢到后台预渲染文字图片，避免弹幕刷屏时在主线程同步光栅化导致掉帧
+        let pre = fresh
+        Self.renderQueue.async {
+            for d in pre { _ = Self.rasterize(d) }
+        }
         let resumeFrom = cursor < queue.count ? queue[cursor].offset : (lastT >= 0 ? lastT : 0)
-        queue = (queue + fresh).sorted { $0.offset == $1.offset ? $0.id < $1.id : $0.offset < $1.offset }
+        // 新弹幕分段到达，队列本身已按 offset 排好：逐条二分插入，避免每次全量 sort（O(n log n) → O(n log k)）
+        for d in fresh {
+            let idx = queue.partitioningIndex { $0.offset == d.offset ? $0.id < d.id : $0.offset < d.offset }
+            queue.insert(d, at: idx)
+        }
         cursor = queue.firstIndex { $0.offset >= resumeFrom } ?? queue.count
     }
 
@@ -131,7 +142,8 @@ final class DYDanmakuEngineView: UIView {
     private func start() {
         guard link == nil, window != nil else { return }
         let l = CADisplayLink(target: DYDanmakuEngineTick(self), selector: #selector(DYDanmakuEngineTick.tick(_:)))
-        l.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
+        // 弹幕按 60Hz 刷新足够（抖音观感不受影响），120Hz 白白烧 GPU/CPU，滑视频时更卡
+        l.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
         l.add(to: .main, forMode: .common)
         link = l
         lastTS = 0
@@ -244,9 +256,13 @@ final class DYDanmakuEngineView: UIView {
         return sizes[d.id] ?? CGSize(width: 60, height: DYDanmakuStyle.laneHeight)
     }
 
-    private func image(for d: DYDanmaku) -> CGImage? {
-        if let i = images[d.id] { return i }
-        if images.count > 800 { images.removeAll(); sizes.removeAll() }
+    /// 文字光栅化（纯函数，可安全在后台队列调用）：进程级缓存，预渲染成果被主线程直接复用
+    nonisolated(unsafe) private static var rasterCache: [String: (CGImage, CGSize)] = [:]
+    private static let rasterLock = NSLock()
+    private static func rasterize(_ d: DYDanmaku) -> (CGImage, CGSize)? {
+        rasterLock.lock()
+        if let hit = rasterCache[d.id] { rasterLock.unlock(); return hit }
+        rasterLock.unlock()
         let font = UIFont.systemFont(ofSize: DYDanmakuStyle.fontSize, weight: .semibold)
         let shadow = NSShadow()
         shadow.shadowColor = UIColor.black.withAlphaComponent(0.7)
@@ -264,9 +280,24 @@ final class DYDanmakuEngineView: UIView {
         let img = UIGraphicsImageRenderer(size: box, format: fmt).image { _ in
             text.draw(at: CGPoint(x: pad, y: pad), withAttributes: attrs)
         }
-        images[d.id] = img.cgImage
-        sizes[d.id] = box
-        return img.cgImage
+        guard let cg = img.cgImage else { return nil }
+        rasterLock.lock()
+        if rasterCache.count > 1500 { rasterCache.removeAll() }
+        rasterCache[d.id] = (cg, box)
+        rasterLock.unlock()
+        return (cg, box)
+    }
+
+    private func image(for d: DYDanmaku) -> CGImage? {
+        if let i = images[d.id] { return i }
+        if images.count > 800 { images.removeAll(); sizes.removeAll() }
+        // 优先命中后台预渲染缓存；未命中才同步渲染兜底（旧弹幕回看等场景）
+        if let (cg, box) = Self.rasterize(d) {
+            images[d.id] = cg
+            sizes[d.id] = box
+            return cg
+        }
+        return nil
     }
 }
 
